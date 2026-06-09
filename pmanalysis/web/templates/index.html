@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — Polymarket Analysis{% endblock %}
+{% block body %}
+<header class="topbar">
+  <div class="topbar-left">
+    <div class="brand">Polymarket Analysis</div>
+    <span id="ws-status" class="ws-badge ws-off">Connecting…</span>
+  </div>
+  <div id="oracle-ticker" class="oracle-ticker"></div>
+  <nav class="topbar-nav">
+    <a href="/" class="active">Dashboard</a>
+    <a href="/history">History</a>
+    <a href="/status">Status</a>
+  </nav>
+</header>
+
+<main class="app-layout">
+  <aside class="sidebar">
+    <div class="sidebar-head">Markets</div>
+    <div id="market-nav" class="market-nav"></div>
+  </aside>
+
+  <section class="workspace">
+    <div class="workspace-head">
+      <div>
+        <h1 id="sel-title">BTC · 5m</h1>
+        <p id="sel-slug" class="slug-text">—</p>
+      </div>
+      <div id="countdown" class="countdown">—</div>
+    </div>
+
+    <div class="chart-panel">
+      <div class="chart-head"><span>Oracle Price</span><span id="oracle-last" class="chart-val">—</span></div>
+      <div id="chart-oracle" class="chart-box"></div>
+    </div>
+
+    <div class="chart-panel">
+      <div class="chart-head"><span>YES / NO Probability</span><span id="prob-last" class="chart-val">—</span></div>
+      <div id="chart-prob" class="chart-box chart-box-sm"></div>
+    </div>
+
+    <div id="overview-grid" class="overview-grid"></div>
+  </section>
+
+  <aside class="metrics-panel">
+    <div class="metric-card highlight" id="position-card">
+      <div class="metric-label">Position vs Strike</div>
+      <div id="position-val" class="metric-value">—</div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-label">YES mid</div>
+      <div id="m-yes" class="metric-value yes">—</div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-label">NO mid</div>
+      <div id="m-no" class="metric-value no">—</div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-label">Combined ask</div>
+      <div id="m-combined" class="metric-value">—</div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-label">Arb edge</div>
+      <div id="m-arb" class="metric-value">—</div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-label">Lean</div>
+      <div id="m-lean" class="metric-value">—</div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-label">Strike</div>
+      <div id="m-strike" class="metric-value">—</div>
+    </div>
+    <div class="metric-card wide">
+      <div class="metric-label">Question</div>
+      <div id="m-question" class="metric-sub">—</div>
+    </div>
+  </aside>
+</main>
+
+<script>
+  window.PM_CONFIG = {
+    assets: {{ assets | tojson }},
+    intervals: {{ intervals | tojson }},
+    preselect: {
+      asset: {{ preselect_asset|default("BTC") | tojson }},
+      interval: {{ preselect_interval|default("5m") | tojson }},
+    },
+  };
+</script>
+{% endblock %}
+{% block scripts %}
+<script src="/static/js/lib/format.js"></script>
+<script src="/static/js/lib/ws.js"></script>
+<script src="/static/js/lib/charts.js"></script>
+<script src="/static/js/dashboard.js"></script>
+{% endblock %}
