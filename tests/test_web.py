@@ -15,7 +15,7 @@ def test_api_markets():
     client = TestClient(create_app())
     response = client.get("/api/markets")
     assert response.status_code == 200
-    assert len(response.json()) == 9
+    assert len(response.json()) == 6
 
 
 def test_market_redirect():

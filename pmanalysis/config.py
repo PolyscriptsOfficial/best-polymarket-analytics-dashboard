@@ -18,9 +18,9 @@ CLOB_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 RTDS_URL = "wss://ws-live-data.polymarket.com"
 
 ASSETS = ("BTC", "ETH", "SOL")
-INTERVALS = ("5m", "15m", "1h")
+INTERVALS = ("5m", "15m")
 
-INTERVAL_SECONDS = {"5m": 300, "15m": 900, "1h": 3600}
+INTERVAL_SECONDS = {"5m": 300, "15m": 900}
 
 MARKET_SLUGS: list[tuple[str, str, str]] = [
     (asset, interval, f"{asset.lower()}-updown-{interval}")

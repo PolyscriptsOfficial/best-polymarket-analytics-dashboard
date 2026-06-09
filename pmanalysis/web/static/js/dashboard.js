@@ -53,37 +53,6 @@
     });
   }
 
-  function renderOverview() {
-    const grid = el("overview-grid");
-    grid.innerHTML = assets
-      .flatMap((asset) =>
-        intervals.map((interval) => {
-          const key = `${asset}:${interval}`;
-          const m = marketByKey[key] || {};
-          const cls = [
-            PM.positionClass(m),
-            selected.asset === asset && selected.interval === interval ? "active" : "",
-          ].join(" ");
-          return `<div class="mini-card ${cls}" data-asset="${asset}" data-interval="${interval}">
-            <h4>${asset} ${interval}</h4>
-            <div class="line"><span>YES</span><span>${PM.fmtProb(m.yes_mid)}</span></div>
-            <div class="line"><span>Oracle</span><span>${PM.fmtUsd(m.oracle_price)}</span></div>
-            <div class="line"><span>Left</span><span>${PM.fmtSecs(m.secs_remaining)}</span></div>
-          </div>`;
-        })
-      )
-      .join("");
-
-    grid.querySelectorAll(".mini-card").forEach((card) => {
-      card.addEventListener("click", () => {
-        selected = { asset: card.dataset.asset, interval: card.dataset.interval };
-        socket.select(selected.asset, selected.interval);
-        renderNav();
-        updateSelectedHeader();
-      });
-    });
-  }
-
   function updateMetrics(m) {
     if (!m) return;
     const pos = m.dist_from_strike;
@@ -123,7 +92,6 @@
       marketByKey = PM.marketMap(msg.markets);
       renderTicker(msg.oracle_prices);
       renderNav();
-      renderOverview();
       updateSelectedHeader();
     },
     onHistory: (msg) => {
@@ -142,7 +110,6 @@
         el("prob-last").textContent = `${PM.fmtProb(msg.point.yes_mid)} / ${PM.fmtProb(msg.point.no_mid)}`;
       }
       renderNav();
-      renderOverview();
     },
   });
 
