@@ -10,11 +10,33 @@ Streams Polymarket CLOB quotes, Chainlink TWAP, and Binance trades. Archives eve
 
 ## Features
 
-- Live terminal for BTC, ETH, SOL Up/Down — CLOB, Chainlink, strike, TWAP
-- 1-second ticks plus optional raw Binance / oracle / CLOB streams
-- History, win-rate stats, CSV and Parquet export
-- YES/NO reversal backtests on stored data
-- Run locally or on a VPS (Windows scripts + PM2)
+**Live terminal** (`/`)
+- BTC, ETH, SOL Up/Down — 5m and 15m
+- Polymarket CLOB YES/NO bid-ask, mid, and spread
+- Chainlink oracle, 60s TWAP, strike, and distance from strike
+- Time remaining, implied YES probability, lean, arb edge
+- 1-minute momentum and 5-minute volatility
+- Lightweight Charts; load any slug or jump back to live
+
+**History and status**
+- `/history` — resolved windows, outcomes, charts, UP/DOWN win rate
+- `/status` — collector health, feed lag, database size
+- CSV export per window; Parquet archive after each window closes
+
+**Collector**
+- Auto-discovers the next Polymarket windows (Gamma API)
+- 1-second merged ticks (oracle + CLOB + indicators)
+- Optional raw streams: Binance trades, Chainlink ticks, CLOB BBO
+- SQLite for live data; 72-hour tick retention after archive
+
+**Backtest**
+- Replay stored ticks (no live API needed)
+- YES/NO ask-reversal counts (e.g. 90¢ flips)
+- BTC grid scan and zip export for offline research
+
+**Run**
+- One process (`start`) or collector + web split
+- Windows local / VPS scripts; PM2 on Linux
 
 ---
 
