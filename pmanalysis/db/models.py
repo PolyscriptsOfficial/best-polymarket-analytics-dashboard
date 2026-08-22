@@ -53,6 +53,7 @@ class Window(Base):
     start_ts: Mapped[int] = mapped_column(BigInteger, nullable=False)
     end_ts: Mapped[int] = mapped_column(BigInteger, nullable=False)
     strike_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    opening_oracle_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     strike_source: Mapped[str | None] = mapped_column(String(32), nullable=True)
     outcome: Mapped[str | None] = mapped_column(String(8), nullable=True)
     final_oracle_price: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -77,6 +78,7 @@ class Tick(Base):
     window_id: Mapped[int] = mapped_column(ForeignKey("windows.id"), nullable=False)
     ts_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
     oracle_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    binance_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     yes_ask: Mapped[float] = mapped_column(Float, default=0.0)
     yes_bid: Mapped[float] = mapped_column(Float, default=0.0)
     no_ask: Mapped[float] = mapped_column(Float, default=0.0)
@@ -104,6 +106,7 @@ class Indicator(Base):
     momentum_1m: Mapped[float | None] = mapped_column(Float, nullable=True)
     volatility_5m: Mapped[float | None] = mapped_column(Float, nullable=True)
     time_decay_factor: Mapped[float] = mapped_column(Float, default=0.0)
+    twap_oracle: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     window: Mapped[Window] = relationship(back_populates="indicators")
 
@@ -133,3 +136,51 @@ class CollectorGap(Base):
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     message: Mapped[str] = mapped_column(Text, default="")
+
+
+class BinanceTrade(Base):
+    """Every Binance spot trade from the WebSocket stream."""
+
+    __tablename__ = "binance_trades"
+    __table_args__ = (Index("ix_binance_trades_asset_ts", "asset", "ts_ms"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    asset: Mapped[str] = mapped_column(String(8), nullable=False)
+    ts_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    price: Mapped[float] = mapped_column(Float, nullable=False)
+    qty: Mapped[float | None] = mapped_column(Float, nullable=True)
+    trade_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+
+class OracleTick(Base):
+    """Every Chainlink/RTDS (and fallback) oracle price update."""
+
+    __tablename__ = "oracle_ticks"
+    __table_args__ = (Index("ix_oracle_ticks_asset_ts", "asset", "ts_ms"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    asset: Mapped[str] = mapped_column(String(8), nullable=False)
+    ts_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    price: Mapped[float] = mapped_column(Float, nullable=False)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default="chainlink")
+
+
+class ClobQuote(Base):
+    """Every CLOB best-bid/ask change from the market WebSocket."""
+
+    __tablename__ = "clob_quotes"
+    __table_args__ = (
+        Index("ix_clob_quotes_token_ts", "token_id", "ts_ms"),
+        Index("ix_clob_quotes_window_ts", "window_id", "ts_ms"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ts_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    token_id: Mapped[str] = mapped_column(String(80), nullable=False)
+    window_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    asset: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    interval: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    side: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    best_ask: Mapped[float] = mapped_column(Float, default=0.0)
+    best_bid: Mapped[float] = mapped_column(Float, default=0.0)
+    event_type: Mapped[str | None] = mapped_column(String(32), nullable=True)

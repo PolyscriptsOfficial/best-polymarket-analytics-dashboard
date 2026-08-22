@@ -1,10 +1,18 @@
 {% extends "base.html" %}
-{% block title %}Status — Polymarket Analysis{% endblock %}
+{% block title %}Status — PolyScripts - Polymarket Analysis{% endblock %}
 {% block body %}
 <header class="topbar">
-  <div class="topbar-left"><div class="brand">Polymarket Analysis</div></div>
+  <div class="topbar-left">
+    <div class="brand">
+      <img class="brand-logo" src="/static/img/p-origin-removebg.png" alt="" width="28" height="28">
+      <span class="brand-text">
+        <span class="brand-name">PolyScripts</span>
+        <span class="brand-sub">Polymarket Analysis</span>
+      </span>
+    </div>
+  </div>
   <nav class="topbar-nav">
-    <a href="/">Dashboard</a>
+    <a href="/">Terminal</a>
     <a href="/history">History</a>
     <a href="/status" class="active">Status</a>
   </nav>
@@ -20,7 +28,10 @@
     <div class="status-card">
       <h3>Data</h3>
       <p>Windows: {{ window_count }}</p>
-      <p>Ticks: {{ tick_count }}</p>
+      <p>Ticks (1s): {{ tick_count }}</p>
+      <p>Binance trades: {{ binance_trade_count }}</p>
+      <p>Oracle ticks: {{ oracle_tick_count }}</p>
+      <p>CLOB quotes: {{ clob_quote_count }}</p>
       <p>Latest tick: {{ latest_tick or "—" }}</p>
     </div>
     <div class="status-card">

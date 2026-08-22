@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 import statistics
 from dataclasses import dataclass, field
 
@@ -47,11 +46,51 @@ def compute_tick_fields(
 @dataclass
 class IndicatorState:
     oracle_history: list[tuple[int, float]] = field(default_factory=list)
+    _twap_weighted_sum: float = 0.0
+    _twap_total_ms: int = 0
+    _last_oracle_ts: int | None = None
+    _last_oracle_price: float | None = None
 
     def add_oracle(self, ts_ms: int, price: float) -> None:
+        if self._last_oracle_ts is not None and self._last_oracle_price is not None:
+            dt = ts_ms - self._last_oracle_ts
+            if dt > 0:
+                self._twap_weighted_sum += self._last_oracle_price * dt
+                self._twap_total_ms += dt
+        self._last_oracle_ts = ts_ms
+        self._last_oracle_price = price
         self.oracle_history.append((ts_ms, price))
         if len(self.oracle_history) > 600:
             self.oracle_history = self.oracle_history[-600:]
+
+    def seed_opening(self, start_ts_ms: int, price: float | None) -> None:
+        """Anchor TWAP at the window-open price (TWAP initial)."""
+        if self._last_oracle_price is not None:
+            return
+        if price is None or price <= 0:
+            return
+        self.add_oracle(start_ts_ms, float(price))
+
+    def twap_initial(self) -> float | None:
+        """First price that seeded the TWAP (window-open anchor)."""
+        if self.oracle_history:
+            return round(self.oracle_history[0][1], 2)
+        if self._last_oracle_price is not None:
+            return round(self._last_oracle_price, 2)
+        return None
+
+    def twap_oracle(self, ts_ms: int) -> float | None:
+        """Time-weighted average oracle price from window open through ts_ms."""
+        if self._last_oracle_price is None:
+            return None
+        if self._last_oracle_ts is None:
+            return round(self._last_oracle_price, 2)
+        dt = max(0, ts_ms - self._last_oracle_ts)
+        total_ms = self._twap_total_ms + dt
+        if total_ms <= 0:
+            return round(self._last_oracle_price, 2)
+        weighted = self._twap_weighted_sum + self._last_oracle_price * dt
+        return round(weighted / total_ms, 2)
 
     def compute(
         self,
@@ -84,6 +123,8 @@ class IndicatorState:
             "momentum_1m": momentum_1m,
             "volatility_5m": volatility_5m,
             "time_decay_factor": time_decay,
+            # twap_oracle is filled from Chainlink RTDS in sampler/live_emitter
+            "twap_oracle": None,
         }
 
 

@@ -17,11 +17,17 @@ class MarketCard(BaseModel):
     combined_ask: float
     oracle_price: float | None
     strike_price: float | None
+    opening_oracle_price: float | None = None
     dist_from_strike: float | None
+    dist_from_opening: float | None = None
+    start_ts: int = 0
+    end_ts: int = 0
     secs_remaining: int
     outcome: str | None
     arb_edge: float | None
     lean: float | None
+    twap_oracle: float | None = None
+    twap_initial: float | None = None
 
 
 class Snapshot(BaseModel):

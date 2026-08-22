@@ -31,6 +31,7 @@ def _window_frame(session: Session, window: Window) -> pd.DataFrame:
             "asset": window.asset,
             "interval": window.interval,
             "oracle_price": tick.oracle_price,
+            "binance_price": tick.binance_price,
             "yes_ask": tick.yes_ask,
             "yes_bid": tick.yes_bid,
             "no_ask": tick.no_ask,
@@ -47,6 +48,7 @@ def _window_frame(session: Session, window: Window) -> pd.DataFrame:
             "lean": ind.lean if ind else None,
             "momentum_1m": ind.momentum_1m if ind else None,
             "volatility_5m": ind.volatility_5m if ind else None,
+            "twap_oracle": getattr(ind, "twap_oracle", None) if ind else None,
             "outcome": window.outcome,
         })
     return pd.DataFrame(rows)
@@ -69,3 +71,23 @@ def export_window_csv(session: Session, window: Window) -> Path:
     out_path = EXPORT_DIR / f"{window.slug}.csv"
     frame.to_csv(out_path, index=False)
     return out_path
+
+
+def archive_path_for(asset: str, interval: str, slug: str) -> Path:
+    return ARCHIVE_DIR / asset.lower() / interval / f"{slug}.parquet"
+
+
+def load_window_frame(window: Window) -> pd.DataFrame | None:
+    """Read a finalized window's full tick history back from its parquet archive.
+
+    Used as the backtest data source once live SQLite ticks/indicators have been
+    pruned for storage/perf reasons (see db/cleanup.py retention job) — the archive
+    is written once per window at finalize time and never touched again.
+    """
+    path = archive_path_for(window.asset, window.interval, window.slug)
+    if not path.exists():
+        return None
+    try:
+        return pd.read_parquet(path)
+    except Exception:
+        return None

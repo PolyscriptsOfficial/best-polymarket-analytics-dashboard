@@ -11,12 +11,8 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 
-from pmanalysis.config import (
-    DISCOVERY_LOOKAHEAD_MINUTES,
-    GAMMA_API,
-    INTERVAL_SECONDS,
-    MARKET_SLUGS,
-)
+from pmanalysis.config import DISCOVERY_LOOKAHEAD_MINUTES, GAMMA_API, INTERVAL_SECONDS, MARKET_SLUGS
+from pmanalysis.feeds.slugs import build_market_slug
 
 log = logging.getLogger(__name__)
 _STRIKE_RE = re.compile(r"\$[\d,]+(?:\.\d+)?")
@@ -39,12 +35,6 @@ def strike_to_float(strike: str | float | None) -> float | None:
         return float(cleaned)
     except ValueError:
         return None
-
-
-def boundary_ts(now: int | None = None, interval: str = "5m") -> int:
-    ts = now if now is not None else int(datetime.now(timezone.utc).timestamp())
-    step = INTERVAL_SECONDS[interval]
-    return (ts // step) * step
 
 
 @dataclass
@@ -79,7 +69,7 @@ class GammaClient:
         seen_slugs: set[str] = set()
 
         async def fetch_direct(asset: str, interval: str, base_slug: str) -> DiscoveredWindow | None:
-            slug = f"{base_slug}-{boundary_ts(interval=interval)}"
+            slug = build_market_slug(asset, interval)
             market = await self.fetch_market_by_slug(slug)
             if not market or not market.get("active"):
                 return None
@@ -90,6 +80,13 @@ class GammaClient:
             return_exceptions=True,
         )
         for result in direct:
+            if isinstance(result, BaseException):
+                log.warning(
+                    "direct discovery failed: %r",
+                    result,
+                    exc_info=result,
+                )
+                continue
             if isinstance(result, DiscoveredWindow) and result.slug not in seen_slugs:
                 out.append(result)
                 seen_slugs.add(result.slug)
@@ -115,7 +112,7 @@ class GammaClient:
             )
             raw = response.json()
         except Exception as exc:
-            log.warning("bulk discovery failed: %s", exc)
+            log.warning("bulk discovery failed: %r", exc, exc_info=True)
             return []
 
         markets = raw if isinstance(raw, list) else []
@@ -176,7 +173,7 @@ class GammaClient:
             asset=asset,
             interval=interval,
             base_slug=base_slug,
-            slug=market.get("slug", f"{base_slug}-{boundary_ts(interval=interval)}"),
+            slug=market.get("slug", build_market_slug(asset, interval)),
             condition_id=market.get("conditionId", "") or "",
             yes_token_id=str(tokens[0]),
             no_token_id=str(tokens[1]),
@@ -197,14 +194,37 @@ class GammaClient:
         if not events:
             return None, None
         event = events[0]
-        meta = event.get("eventMetadata") or {}
+
+        for meta in (event.get("eventMetadata"), event):
+            price = self._parse_price_to_beat(meta)
+            if price is not None:
+                return price, "gamma"
+
+        event_id = event.get("id")
+        if event_id:
+            try:
+                detail = await self._client.get(f"{GAMMA_API}/events/{event_id}")
+                if detail.status_code == 200:
+                    detail_event = detail.json()
+                    for meta in (detail_event.get("eventMetadata"), detail_event):
+                        price = self._parse_price_to_beat(meta)
+                        if price is not None:
+                            return price, "gamma"
+            except Exception:
+                pass
+
+        return None, None
+
+    def _parse_price_to_beat(self, meta: object) -> float | None:
+        if not isinstance(meta, dict):
+            return None
         price = meta.get("priceToBeat")
         if price is None:
-            return None, None
+            return None
         try:
-            return float(price), "gamma"
+            return float(price)
         except (TypeError, ValueError):
-            return None, None
+            return None
 
     async def fetch_resolution(self, slug: str) -> tuple[str | None, float | None]:
         response = await self._client.get(

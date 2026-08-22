@@ -1,6 +1,6 @@
 # Polymarket Analysis
 
-Uses **system Python** — no venv required.
+Uses **system Python** - no venv required.
 
 ## First time only
 
@@ -17,17 +17,17 @@ Or:
 
 ## Run backend + web separately
 
-**Terminal 1 — backend:**
+**Terminal 1 - backend:**
 ```powershell
 .\scripts\collector.ps1
 ```
 
-**Terminal 2 — web:**
+**Terminal 2 - web:**
 ```powershell
 .\scripts\web.ps1
 ```
 
-Open **http://127.0.0.1:8001**
+Open **http://127.0.0.1:8000**
 
 ## Run both together
 
@@ -48,4 +48,22 @@ python -m pmanalysis start       # both in one
 ```powershell
 $env:PM_PORT = "8000"
 .\scripts\web.ps1
+```
+
+## Feed stream recording
+
+The collector also saves **every** Binance trade, Chainlink/oracle tick, and CLOB orderbook BBO change (batched to SQLite):
+
+| Table | Source |
+|-------|--------|
+| `binance_trades` | Binance `@trade` WebSocket |
+| `oracle_ticks` | Polymarket RTDS Chainlink (+ fallbacks) |
+| `clob_quotes` | Polymarket CLOB market WebSocket |
+
+Still kept: 1-second merged samples in `ticks`.
+
+```powershell
+# default ON - disable if needed:
+$env:PM_FEED_RECORD = "0"
+.\scripts\run.ps1
 ```

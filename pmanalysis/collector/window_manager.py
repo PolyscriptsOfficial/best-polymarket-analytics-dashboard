@@ -6,9 +6,18 @@ from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
-from pmanalysis.config import INTERVAL_SECONDS
+from pmanalysis.config import INTERVAL_SECONDS, RESOLUTION_MAX_WAIT_SEC
 from pmanalysis.db.models import Market, Window
+from pmanalysis.feeds.chainlink import ChainlinkFeed
 from pmanalysis.feeds.gamma import DiscoveredWindow, GammaClient, strike_to_float
+from pmanalysis.feeds.slugs import boundary_ts
+from pmanalysis.collector.window_cache import CachedWindow
+from pmanalysis.feeds.opening_price import (
+    apply_opening_price,
+    capture_final_oracle_price,
+    oracle_from_ticks_at_end,
+    seed_opening_from_previous,
+)
 
 
 class WindowManager:
@@ -41,17 +50,43 @@ class WindowManager:
         by_id = {row.id: row for row in rows}
         return [by_id[i] for i in ids if i in by_id]
 
-    async def sync_discovered(self, session: Session, discovered: list[DiscoveredWindow]) -> list[str]:
+    def needs_roll_discovery(self, session: Session, now_ts: int) -> bool:
+        for window in self.get_active_windows(session):
+            if now_ts >= window.end_ts:
+                return True
+            expected_start = boundary_ts(now_ts, window.interval)
+            if window.start_ts != expected_start:
+                return True
+        return False
+
+    def sync_discovered(
+        self,
+        session: Session,
+        discovered: list[DiscoveredWindow],
+        chainlink: ChainlinkFeed | None = None,
+    ) -> tuple[list[str], list[tuple[str, str, int | None]]]:
         token_ids: list[str] = []
+        rolled: list[tuple[str, str, int | None]] = []
         market_map = {m.base_slug: m for m in session.query(Market).all()}
         for item in discovered:
             key = f"{item.asset}:{item.interval}"
             market = market_map.get(item.base_slug)
             if not market:
                 continue
+            prev_id = self._active_ids.get(key)
+            prev_row = None
+            prev_slug = None
+            if prev_id:
+                prev_row = session.query(Window).filter_by(id=prev_id).first()
+                prev_slug = prev_row.slug if prev_row else None
             existing = session.query(Window).filter_by(slug=item.slug).first()
             if existing:
                 self._active_ids[key] = existing.id
+                if prev_slug and prev_slug != item.slug:
+                    rolled.append((item.asset, item.interval, prev_id))
+                    if chainlink and prev_row:
+                        capture_final_oracle_price(session, prev_row, chainlink)
+                        seed_opening_from_previous(session, existing, chainlink)
             else:
                 window = Window(
                     market_id=market.id,
@@ -70,36 +105,106 @@ class WindowManager:
                 session.add(window)
                 session.flush()
                 self._active_ids[key] = window.id
+                if prev_slug and prev_slug != item.slug:
+                    rolled.append((item.asset, item.interval, prev_id))
+                    if chainlink and prev_row:
+                        capture_final_oracle_price(session, prev_row, chainlink)
+                        seed_opening_from_previous(session, window, chainlink)
             token_ids.extend([item.yes_token_id, item.no_token_id])
         session.commit()
-        return list(dict.fromkeys(token_ids))
+        return list(dict.fromkeys(token_ids)), rolled
 
-    async def refresh_strikes(self, session: Session) -> None:
+    def seed_openings_from_previous(
+        self, session: Session, chainlink: ChainlinkFeed
+    ) -> None:
+        """Fill missing opening prices from the prior window's close."""
         for window in self.get_active_windows(session):
-            if window.strike_price is not None and window.strike_source == "gamma":
+            if window.opening_oracle_price is not None:
                 continue
-            strike, source = await self.gamma.fetch_strike(window.slug)
-            if strike is not None:
-                window.strike_price = strike
-                window.strike_source = source
-                session.add(window)
+            seed_opening_from_previous(session, window, chainlink)
+
+    async def refresh_opening_prices(
+        self, session: Session, chainlink: ChainlinkFeed
+    ) -> None:
+        self.seed_openings_from_previous(session, chainlink)
+        for window in self.get_active_windows(session):
+            await apply_opening_price(session, window, chainlink, self.gamma)
         session.commit()
 
-    async def finalize_expired(self, session: Session, now_ts: int, grace_sec: int) -> list[Window]:
-        finalized: list[Window] = []
-        for key, window_id in list(self._active_ids.items()):
-            window = session.query(Window).filter_by(id=window_id).first()
-            if not window or now_ts < window.end_ts + grace_sec:
+    async def capture_openings_for_asset(
+        self, session: Session, asset: str, chainlink: ChainlinkFeed
+    ) -> bool:
+        """Try to fill missing opening prices for active windows of one asset."""
+        changed = False
+        for window in self.get_active_windows(session):
+            if window.asset != asset:
                 continue
+            if await apply_opening_price(session, window, chainlink, self.gamma):
+                changed = True
+        if changed:
+            session.commit()
+        return changed
+
+    async def refresh_strikes(self, session: Session, chainlink: ChainlinkFeed) -> None:
+        for window in self.get_active_windows(session):
+            await apply_opening_price(session, window, chainlink, self.gamma)
+        session.commit()
+
+    async def finalize_expired(
+        self,
+        session: Session,
+        now_ts: int,
+        grace_sec: int,
+        chainlink: ChainlinkFeed | None = None,
+    ) -> list[Window]:
+        """Resolve+finalize windows past end_ts+grace that aren't resolved yet.
+
+        Queries `resolved_at IS NULL` directly instead of iterating
+        `_active_ids`: the next window's roll discovery replaces
+        `_active_ids[key]` almost immediately at the boundary (often before
+        this runs), so relying on `_active_ids` alone meant an expired window
+        could silently fall out of tracking and never get resolved. Gamma also
+        frequently hasn't published a winner within the old fixed grace
+        period, which froze `outcome=None` forever; we now retry for up to
+        `RESOLUTION_MAX_WAIT_SEC` before falling back to a final-oracle vs
+        strike comparison.
+        """
+        finalized: list[Window] = []
+        candidates = (
+            session.query(Window)
+            .filter(Window.resolved_at.is_(None), Window.end_ts + grace_sec <= now_ts)
+            .all()
+        )
+        for window in candidates:
             outcome, _ = await self.gamma.fetch_resolution(window.slug)
+            overdue = now_ts - window.end_ts >= RESOLUTION_MAX_WAIT_SEC
+            if not outcome and not overdue:
+                continue  # Gamma hasn't published a winner yet; retry next sweep.
+
+            if chainlink:
+                capture_final_oracle_price(session, window, chainlink)
+            elif window.final_oracle_price is None:
+                final = oracle_from_ticks_at_end(session, window.id, window.end_ts)
+                if final is not None:
+                    window.final_oracle_price = final
+
             if outcome:
                 window.outcome = outcome
+            elif window.strike_price is not None and window.final_oracle_price is not None:
+                # Gamma fallback: infer from final oracle vs strike (best-effort,
+                # matches Polymarket's own crypto up/down settlement rule).
+                window.outcome = (
+                    "UP" if window.final_oracle_price > window.strike_price else "DOWN"
+                )
+
             window.resolved_at = datetime.now(timezone.utc)
             session.add(window)
             finalized.append(window)
-            del self._active_ids[key]
+            key = f"{window.asset}:{window.interval}"
+            if self._active_ids.get(key) == window.id:
+                del self._active_ids[key]
         session.commit()
         return finalized
 
-    def window_duration(self, window: Window) -> int:
+    def window_duration(self, window: Window | CachedWindow) -> int:
         return INTERVAL_SECONDS.get(window.interval, window.end_ts - window.start_ts)
