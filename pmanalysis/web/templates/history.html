@@ -1,35 +1,27 @@
 {% extends "base.html" %}
 {% block title %}History - Polymarket Analysis{% endblock %}
+{% block head %}
+<script src="/static/vendor/lightweight-charts.standalone.production.js"></script>
+{% endblock %}
 {% block body %}
-<header class="topbar">
-  <div class="topbar-left">
-    <div class="brand">
-      <img class="brand-logo" src="/static/img/p-origin-removebg.png" alt="" width="28" height="28">
-      <span class="brand-text">
-        <span class="brand-name">PolyScripts</span>
-        <span class="brand-sub">Polymarket Analysis</span>
-      </span>
-    </div>
-  </div>
-  <nav class="topbar-nav">
-    <a href="/">Terminal</a>
-    <a href="/history" class="active">History</a>
-    <a href="/status">Status</a>
-  </nav>
-</header>
+{% include "partials/topbar.html" %}
 <div class="page-container">
   <div class="history-head">
     <h1>Database History</h1>
-    <button type="button" id="clear-db-btn" class="btn-danger">Clear Database</button>
   </div>
 
   <div class="history-stats" id="history-stats">Loading counts…</div>
 
+  <div class="win-rate-panel">
+    <div class="win-rate-label">UP win rate</div>
+    <div class="history-stats win-rate-stats" id="win-rate-stats">Loading win rates…</div>
+  </div>
+
   <div class="history-tabs" id="history-tabs">
     <button type="button" class="history-tab active" data-tab="windows">Windows</button>
-    <button type="button" class="history-tab" data-tab="binance">Binance</button>
-    <button type="button" class="history-tab" data-tab="oracle">Chainlink / Oracle</button>
-    <button type="button" class="history-tab" data-tab="clob">Orderbook (CLOB)</button>
+    <button type="button" class="history-tab hidden" data-tab="binance" data-raw="1">Binance</button>
+    <button type="button" class="history-tab hidden" data-tab="oracle" data-raw="1">Chainlink / Oracle</button>
+    <button type="button" class="history-tab hidden" data-tab="clob" data-raw="1">Orderbook (CLOB)</button>
   </div>
 
   <div class="history-toolbar">
@@ -68,14 +60,31 @@
   </div>
 
   <div class="chart-panel" id="replay-panel" style="margin-top:1rem">
-    <div class="chart-head"><span>Window Replay</span></div>
+    <div class="chart-head">
+      <div class="chart-head-left">
+        <span id="replay-title">Window replay</span>
+        <div class="chart-legend" aria-hidden="true">
+          <span class="legend-item legend-binance">Binance spot</span>
+          <span class="legend-item legend-chainlink">Chainlink</span>
+          <span class="legend-item legend-twap">TWAP 60s</span>
+          <span class="legend-item legend-target">Target</span>
+        </div>
+      </div>
+    </div>
     <div id="replay-oracle" class="chart-box"></div>
+    <div class="chart-head replay-prob-head">
+      <span class="chart-title">Probability</span>
+      <div class="chart-legend" aria-hidden="true">
+        <span class="legend-item legend-yes">YES ask</span>
+        <span class="legend-item legend-no">NO ask</span>
+      </div>
+    </div>
     <div id="replay-prob" class="chart-box chart-box-sm"></div>
   </div>
 </div>
 {% endblock %}
 {% block scripts %}
-<script src="/static/js/lib/format.js"></script>
-<script src="/static/js/lib/charts.js?v=term37"></script>
-<script src="/static/js/history.js?v=term37"></script>
+<script src="/static/js/lib/format.js?v=term49"></script>
+<script src="/static/js/lib/charts.js?v=term59"></script>
+<script src="/static/js/history.js?v=term49"></script>
 {% endblock %}

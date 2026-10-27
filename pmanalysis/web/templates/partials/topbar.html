@@ -1,0 +1,45 @@
+{% set path = request.url.path %}
+{% set on_terminal = path == '/' or path.startswith('/market/') %}
+<header class="topbar">
+  <div class="topbar-left">
+    <a
+      href="https://polyscripts.world"
+      class="brand brand-link"
+      target="_blank"
+      rel="noopener noreferrer"
+      title="PolyScripts — polyscripts.world"
+    >
+      <img class="brand-logo" src="/static/img/p-origin-removebg.png?v=orig1" alt="" width="28" height="28">
+      <span class="brand-text">
+        <span class="brand-name">
+          PolyScripts
+          <img class="brand-badge" src="/static/img/polymarket-badge.png?v=orig1" alt="Polymarket" title="Powered by Polymarket" width="14" height="14">
+        </span>
+        <span class="brand-sub">
+          Polymarket Analysis
+          <span class="brand-version" aria-label="Version">v1.0</span>
+        </span>
+      </span>
+    </a>
+    {% if on_terminal %}
+    <span id="ws-status" class="ws-badge ws-off">Connecting…</span>
+    {% endif %}
+  </div>
+  {% if on_terminal %}
+  <div id="oracle-ticker" class="oracle-ticker" aria-label="Live oracle ticker"></div>
+  {% endif %}
+  <div class="topbar-actions">
+    <button
+      type="button"
+      class="help-trigger"
+      id="help-open"
+      aria-label="About PolyScripts and API"
+      title="About this app"
+    >?</button>
+    <nav class="topbar-nav" aria-label="Primary">
+      <a href="/" class="{{ 'active' if on_terminal else '' }}">Terminal</a>
+      <a href="/history" class="{{ 'active' if path == '/history' else '' }}">History</a>
+      <a href="/status" class="{{ 'active' if path == '/status' else '' }}">Status</a>
+    </nav>
+  </div>
+</header>

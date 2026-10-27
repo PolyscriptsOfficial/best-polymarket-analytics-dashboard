@@ -1,44 +1,63 @@
 {% extends "base.html" %}
 {% block title %}Status — PolyScripts - Polymarket Analysis{% endblock %}
 {% block body %}
-<header class="topbar">
-  <div class="topbar-left">
-    <div class="brand">
-      <img class="brand-logo" src="/static/img/p-origin-removebg.png" alt="" width="28" height="28">
-      <span class="brand-text">
-        <span class="brand-name">PolyScripts</span>
-        <span class="brand-sub">Polymarket Analysis</span>
-      </span>
-    </div>
-  </div>
-  <nav class="topbar-nav">
-    <a href="/">Terminal</a>
-    <a href="/history">History</a>
-    <a href="/status" class="active">Status</a>
-  </nav>
-</header>
+{% include "partials/topbar.html" %}
 <div class="page-container">
-  <h1>System Status</h1>
+  <div class="history-head">
+    <h1>System Status</h1>
+    <p class="status-refresh-hint" id="status-updated">Refreshing every 5s</p>
+  </div>
+
+  <h2 class="status-section-title">Feed lag</h2>
+  <div class="status-grid" id="feed-grid"></div>
+
+  <h2 class="status-section-title">Collector</h2>
   <div class="status-grid">
     <div class="status-card">
+      <h3>Live mode</h3>
+      <p>Embedded collector: <span id="st-embed">{{ "yes" if embed_collector else "no (DB sync)" }}</span></p>
+      <p>Collector running: <span id="st-running">{{ "yes" if collector_running|default(false) else "no" }}</span></p>
+      <p>Feed recording: <span id="st-record">{{ "on" if feed_record|default(false) else "off" }}</span></p>
+      <p>Last 1s tick: <span id="st-last-tick">{{ last_tick_at|default(none) or "—" }}</span></p>
+      <p>Last discovery: <span id="st-last-discovery">{{ last_discovery_at|default(none) or "—" }}</span></p>
+      <p>Stream: WebSocket /ws/live</p>
+    </div>
+    <div class="status-card">
       <h3>Database</h3>
-      <p>Path: {{ health.path }}</p>
-      <p>Size: {{ health.size_mb }} MB</p>
+      <p>Path: <span id="st-db-path">{{ health.path }}</span></p>
+      <p>Size: <span id="st-db-size">{{ health.size_mb }} MB</span></p>
     </div>
     <div class="status-card">
       <h3>Data</h3>
-      <p>Windows: {{ window_count }}</p>
-      <p>Ticks (1s): {{ tick_count }}</p>
-      <p>Binance trades: {{ binance_trade_count }}</p>
-      <p>Oracle ticks: {{ oracle_tick_count }}</p>
-      <p>CLOB quotes: {{ clob_quote_count }}</p>
-      <p>Latest tick: {{ latest_tick or "—" }}</p>
-    </div>
-    <div class="status-card">
-      <h3>Live mode</h3>
-      <p>Embedded collector: {{ "yes" if embed_collector else "no (DB sync)" }}</p>
-      <p>Stream: WebSocket /ws/live</p>
+      <p>Windows: <span id="st-windows">{{ window_count }}</span></p>
+      <p>Ticks (1s): <span id="st-ticks">{{ tick_count }}</span></p>
+      <p>Binance trades: <span id="st-binance">{{ binance_trade_count }}</span></p>
+      <p>Oracle ticks: <span id="st-oracle">{{ oracle_tick_count }}</span></p>
+      <p>CLOB quotes: <span id="st-clob">{{ clob_quote_count }}</span></p>
     </div>
   </div>
+
+  <h2 class="status-section-title">Open gaps</h2>
+  <div class="table-wrap status-table-wrap">
+    <table class="data-table" id="gaps-open-table">
+      <thead>
+        <tr><th>Source</th><th>Started</th><th>Duration</th><th>Detail</th></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+  <h2 class="status-section-title">Recent gaps</h2>
+  <div class="table-wrap status-table-wrap">
+    <table class="data-table" id="gaps-recent-table">
+      <thead>
+        <tr><th>Source</th><th>Started</th><th>Ended</th><th>Duration</th><th>Detail</th></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
 </div>
+{% endblock %}
+{% block scripts %}
+<script src="/static/js/status.js?v=term38"></script>
 {% endblock %}
