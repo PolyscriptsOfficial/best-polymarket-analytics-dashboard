@@ -8,8 +8,7 @@ import logging
 import sys
 
 from pmanalysis.collector.service import CollectorService
-from pmanalysis.config import WEB_HOST, WEB_PORT, ensure_data_dirs
-from pmanalysis.db.clear import clear_database
+from pmanalysis.config import TICK_RETENTION_HOURS, WEB_HOST, WEB_PORT, ensure_data_dirs
 from pmanalysis.web.app import run_web
 
 log = logging.getLogger(__name__)
@@ -49,35 +48,38 @@ def _cmd_start() -> None:
     run_web(embed_collector=True)
 
 
-def _cmd_clear_db(yes: bool, keep_archives: bool) -> None:
+def _cmd_prune_db(yes: bool, vacuum: bool) -> None:
+    from pmanalysis.db.cleanup import compact_live_db, vacuum_db
+    from pmanalysis.db.session import db_health, init_db
+
     if not yes:
-        print(
-            "This will DELETE all windows, ticks, indicators, feed streams, candles, and gap logs."
-        )
-        if not keep_archives:
-            print("Parquet archives and CSV exports will also be removed.")
-        print("Market definitions (BTC/ETH/SOL) are kept.")
+        print("Stop the collector first. This rebuilds SQLite:")
+        print("  - keeps windows catalog (names, outcomes)")
+        print(f"  - keeps 1s ticks from the last {TICK_RETENTION_HOURS}h")
+        print("  - drops raw Binance / Oracle / CLOB tables")
+        print("  - keeps parquet archives")
+        if vacuum:
+            print("  - VACUUM (usually unnecessary after compact)")
         answer = input("Type 'yes' to continue: ").strip().lower()
         if answer != "yes":
             print("Aborted.")
             return
 
-    result = clear_database(include_archives=not keep_archives)
-    cleared = result["cleared"]
-    print("Database cleared.")
-    print(f"  ticks:           {cleared.get('ticks', 0)}")
-    print(f"  indicators:      {cleared.get('indicators', 0)}")
-    print(f"  binance_trades:  {cleared.get('binance_trades', 0)}")
-    print(f"  oracle_ticks:    {cleared.get('oracle_ticks', 0)}")
-    print(f"  clob_quotes:     {cleared.get('clob_quotes', 0)}")
-    print(f"  windows:         {cleared.get('windows', 0)}")
-    print(f"  candles:         {cleared.get('candles', 0)}")
-    print(f"  gap logs:        {cleared.get('collector_gaps', 0)}")
-    if not keep_archives:
-        print(f"  archive dir: {result['archive_entries_removed']} entries removed")
-        print(f"  export dir:  {result['export_entries_removed']} entries removed")
-    print(f"  db:          {result['db_path']} ({result['db_size_mb']} MB)")
-    print("Restart the collector to begin recording fresh data.")
+    result = compact_live_db()
+    if not result.get("ok"):
+        print(f"Compact failed: {result.get('error')}")
+        return
+    init_db()
+    print("Live database compacted.")
+    print(f"  windows: {result.get('windows')}")
+    print(f"  ticks:   {result.get('ticks')} (last {result.get('retention_hours')}h)")
+    print(f"  size:    {result.get('size_mb_before')} MB -> {result.get('size_mb_after')} MB")
+    if vacuum:
+        print("VACUUM…")
+        vacuum_db()
+        print("VACUUM complete.")
+    health = db_health()
+    print(f"  db: {health.get('path')} ({health.get('size_mb')} MB)")
 
 
 def _check_deps() -> None:
@@ -103,20 +105,15 @@ def main(argv: list[str] | None = None) -> None:
     sub.add_parser("collector", help="Run data collector only")
     sub.add_parser("web", help="Run web dashboard only (DB sync mode)")
     sub.add_parser("start", help="Run collector + web together (recommended)")
-    clear_p = sub.add_parser(
-        "clear-db",
-        help="Wipe collected data (ticks, windows, archives) for a fresh start",
+    prune_p = sub.add_parser(
+        "prune-db",
+        help="Drop raw feeds and archived 1s ticks older than retention; keep windows + parquet",
     )
-    clear_p.add_argument(
-        "-y",
-        "--yes",
+    prune_p.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompt")
+    prune_p.add_argument(
+        "--vacuum",
         action="store_true",
-        help="Skip confirmation prompt",
-    )
-    clear_p.add_argument(
-        "--keep-archives",
-        action="store_true",
-        help="Keep parquet archive and CSV export files",
+        help="VACUUM SQLite afterwards so the file shrinks on disk",
     )
 
     args = parser.parse_args(argv)
@@ -129,8 +126,8 @@ def main(argv: list[str] | None = None) -> None:
         run_web(embed_collector=False)
     elif args.command == "start":
         _cmd_start()
-    elif args.command == "clear-db":
-        _cmd_clear_db(yes=args.yes, keep_archives=args.keep_archives)
+    elif args.command == "prune-db":
+        _cmd_prune_db(yes=args.yes, vacuum=args.vacuum)
     else:
         parser.print_help()
         sys.exit(1)

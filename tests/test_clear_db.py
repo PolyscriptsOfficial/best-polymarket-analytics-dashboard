@@ -6,6 +6,8 @@ from pmanalysis.db.session import get_session, init_db
 def test_clear_database_keeps_markets(tmp_path, monkeypatch):
     monkeypatch.setattr("pmanalysis.db.clear.DB_PATH", tmp_path / "test.db")
     monkeypatch.setattr("pmanalysis.db.session.DB_PATH", tmp_path / "test.db")
+    monkeypatch.setattr("pmanalysis.db.session._engine", None)
+    monkeypatch.setattr("pmanalysis.db.session._SessionLocal", None)
     monkeypatch.setattr("pmanalysis.db.clear.ARCHIVE_DIR", tmp_path / "archive")
     monkeypatch.setattr("pmanalysis.db.clear.EXPORT_DIR", tmp_path / "exports")
 

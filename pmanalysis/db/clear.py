@@ -71,6 +71,13 @@ def clear_database(*, include_archives: bool = True) -> dict:
         export_removed = _remove_tree_contents(EXPORT_DIR)
 
     try:
+        from pmanalysis.datasets.query import clear_archive_fingerprint_cache
+
+        clear_archive_fingerprint_cache()
+    except Exception:
+        pass
+
+    try:
         from pmanalysis.core.live_store import get_live_store
         from pmanalysis.web.sync import reset_history_load_cache
 

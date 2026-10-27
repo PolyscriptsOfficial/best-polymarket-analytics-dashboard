@@ -30,7 +30,7 @@ def get_engine():
         # NullPool: open/close per session — avoids SQLite pool exhaustion under async load.
         _engine = create_engine(
             _sqlite_url(),
-            connect_args={"check_same_thread": False, "timeout": 30},
+            connect_args={"check_same_thread": False, "timeout": 60},
             poolclass=NullPool,
         )
 
@@ -39,6 +39,9 @@ def get_engine():
             cursor = dbapi_conn.cursor()
             cursor.execute("PRAGMA journal_mode=WAL")
             cursor.execute("PRAGMA synchronous=NORMAL")
+            cursor.execute("PRAGMA busy_timeout=60000")
+            cursor.execute("PRAGMA cache_size=-65536")  # 64 MiB page cache
+            cursor.execute("PRAGMA temp_store=MEMORY")
             cursor.close()
 
         _SessionLocal = sessionmaker(bind=_engine, autoflush=False, autocommit=False)
@@ -55,12 +58,35 @@ def _migrate_columns(engine) -> None:
         tick_cols = {row[1] for row in conn.execute(text("PRAGMA table_info(ticks)")).fetchall()}
         if "binance_price" not in tick_cols:
             conn.execute(text("ALTER TABLE ticks ADD COLUMN binance_price FLOAT"))
+        if "binance_perp_price" not in tick_cols:
+            conn.execute(text("ALTER TABLE ticks ADD COLUMN binance_perp_price FLOAT"))
 
         indicator_cols = {
             row[1] for row in conn.execute(text("PRAGMA table_info(indicators)")).fetchall()
         }
         if "twap_oracle" not in indicator_cols:
             conn.execute(text("ALTER TABLE indicators ADD COLUMN twap_oracle FLOAT"))
+
+        tables = {
+            row[0]
+            for row in conn.execute(
+                text("SELECT name FROM sqlite_master WHERE type='table'")
+            ).fetchall()
+        }
+        if "collector_gaps" in tables:
+            conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_collector_gaps_source_ended "
+                    "ON collector_gaps (source, ended_at)"
+                )
+            )
+        if "windows" in tables:
+            conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_windows_asset_interval_start "
+                    "ON windows (asset, interval, start_ts)"
+                )
+            )
 
 
 def _purge_retired_intervals(session: Session) -> None:
@@ -119,6 +145,15 @@ def get_session() -> Generator[Session, None, None]:
 async def run_db(fn: Callable[[], T]) -> T:
     """Run blocking DB work off the asyncio event loop."""
     return await asyncio.to_thread(fn)
+
+
+def reset_engine() -> None:
+    """Drop the cached SQLAlchemy engine so the next call reopens DB_PATH."""
+    global _engine, _SessionLocal
+    if _engine is not None:
+        _engine.dispose()
+    _engine = None
+    _SessionLocal = None
 
 
 def db_health() -> dict:
