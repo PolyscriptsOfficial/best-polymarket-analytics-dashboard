@@ -1,0 +1,59 @@
+<div class="help-backdrop" id="help-backdrop" hidden></div>
+<dialog class="help-dialog" id="help-dialog" aria-labelledby="help-dialog-title">
+  <div class="help-dialog-head">
+    <h2 id="help-dialog-title">About PolyScripts Analysis</h2>
+    <button type="button" class="help-close" id="help-close" aria-label="Close">×</button>
+  </div>
+  <div class="help-dialog-body">
+    <section class="help-section">
+      <h3>What this is</h3>
+      <p>
+        <strong>PolyScripts Polymarket Analysis</strong> is a live research terminal for Polymarket
+        <strong>BTC, ETH, and SOL</strong> Up or Down markets on <strong>5-minute</strong> and
+        <strong>15-minute</strong> clock windows. It streams Chainlink oracle and TWAP, Binance spot,
+        and Polymarket CLOB quotes, records every window, and lets you replay history.
+      </p>
+      <p class="help-muted">
+        This tool does <strong>not</strong> place trades or connect to your wallet. It is for monitoring,
+        timing, and offline research only.
+      </p>
+      <p>
+        Built by
+        <a href="https://polyscripts.world" target="_blank" rel="noopener noreferrer">PolyScripts</a>.
+      </p>
+    </section>
+
+    <section class="help-section">
+      <h3>How traders use it</h3>
+      <ul class="help-list">
+        <li>Pick an asset and interval in the left <strong>Markets</strong> panel and watch the live HUD (initial TWAP, Chainlink, 60s TWAP, difference, countdown).</li>
+        <li>Use the <strong>price</strong> and <strong>probability</strong> charts for the current window; the target line is the window-open TWAP (price to beat).</li>
+        <li>At each 5m/15m boundary the terminal rolls to the new slug automatically — no manual refresh.</li>
+        <li>Open <strong>History</strong> to browse resolved windows, UP/DOWN win rates, and replay ticks.</li>
+        <li>Use <strong>Status</strong> to check Binance, Chainlink, and CLOB feed health on your collector.</li>
+        <li>Load a past slug from the window dropdown or sidebar previews to study a single window in detail.</li>
+      </ul>
+    </section>
+
+    <section class="help-section">
+      <h3>API for your backtest app</h3>
+      <p>
+        Point your backtest machine at this collector’s base URL (same host as this dashboard, e.g.
+        <code class="help-code" id="help-base-url">http://127.0.0.1:8000</code>). The
+        <strong>/v1</strong> dataset API is public JSON — no API key required.
+      </p>
+      <ol class="help-list help-list-ordered">
+        <li><code>GET /v1/coverage</code> — see which date range is archived per market.</li>
+        <li><code>POST /v1/datasets</code> — request a zip for a start/end time and markets (e.g. BTC 5m).</li>
+        <li><code>GET /v1/datasets/{id}</code> — poll until <code>status</code> is <code>ready</code>.</li>
+        <li><code>GET /v1/datasets/{id}/download</code> — save the zip and run locally (no live API during the backtest).</li>
+      </ol>
+      <p>Example (from a machine that can reach this collector):</p>
+      <pre class="help-pre"><code id="help-fetch-cmd">python scripts/fetch_dataset.py --url YOUR_COLLECTOR_URL --start 2026-10-01T00:00:00Z --end 2026-10-27T00:00:00Z --asset BTC --interval 5m</code></pre>
+      <p class="help-muted">
+        Full API contract: <code>docs/history-dataset.md</code> in the project repository
+        (coverage, dataset schema, parquet layout, and cache rules).
+      </p>
+    </section>
+  </div>
+</dialog>
