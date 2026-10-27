@@ -10,33 +10,34 @@ Streams Polymarket CLOB quotes, Chainlink TWAP, and Binance trades. Archives eve
 
 ## Features
 
+Full write-up: **[FEATURES.md](FEATURES.md)** · Recent changes: **[CHANGELOG.md](CHANGELOG.md)**
+
 **Live terminal** (`/`)
 - BTC, ETH, SOL Up/Down — 5m and 15m
-- Polymarket CLOB YES/NO bid-ask, mid, and spread
-- Chainlink oracle, 60s TWAP, strike, and distance from strike
-- Time remaining, implied YES probability, lean, arb edge
-- 1-minute momentum and 5-minute volatility
-- Lightweight Charts; load any slug or jump back to live
+- Clock-based window rolls (charts + TWAP target reset at the 5m/15m boundary; countdown stays live)
+- Chainlink spot + 60s TWAP, initial TWAP (price to beat) synced to chart target line, Binance overlay
+- Reliable history fill when switching 5m/15m or after a roll (REST + WebSocket backfill)
+- Polymarket CLOB YES/NO asks
+- UP/DOWN candlesticks: 5m per candle on 5m markets, 15m per candle on 15m
+- Recent-markets sidebar (current + past windows; not the blank next market)
+- Load any slug or jump back to live; Open market on Polymarket
 
 **History and status**
-- `/history` — resolved windows, outcomes, charts, UP/DOWN win rate
-- `/status` — collector health, feed lag, database size
-- CSV export per window; Parquet archive after each window closes
+- `/history` — resolved windows, outcomes, replay charts, UP/DOWN win rate
+- `/status` — collector health, feed lag, gaps, database size
+- CSV export per window; parquet archive after each window closes
 
 **Collector**
-- Auto-discovers the next Polymarket windows (Gamma API)
+- Discovers current + next Gamma slugs; CLOB overlap ~30s before the roll
 - 1-second merged ticks (oracle + CLOB + indicators)
-- Optional raw streams: Binance trades, Chainlink ticks, CLOB BBO
-- SQLite for live data; 72-hour tick retention after archive
+- SQLite hot store (~24h of 1s ticks); parquet for older History charts
+- Optional raw streams (`PM_FEED_RECORD=1`) for short debug captures
 
 **Backtest**
 - Replay stored ticks (no live API needed)
 - YES/NO ask-reversal counts (e.g. 90¢ flips)
 - BTC grid scan and zip export for offline research
-
-**Run**
-- One process (`start`) or collector + web split
-- Windows local / VPS scripts; PM2 on Linux
+- Remote period zip (`/v1/datasets`) so another PC can backtest one market + date range — [docs/history-dataset.md](docs/history-dataset.md)
 
 ---
 
@@ -71,19 +72,23 @@ Linux: `pm2 start ecosystem.config.js`
 
 | Table | Source |
 |-------|--------|
-| `ticks` | 1s merged samples (always on) |
-| `binance_trades` | Binance `@trade` (optional) |
-| `oracle_ticks` | Chainlink / Polymarket RTDS (optional) |
-| `clob_quotes` | Polymarket CLOB BBO (optional) |
+| Store | What |
+|-------|------|
+| `ticks` (SQLite, ~24h) | 1s merged samples for the live UI |
+| `windows` (SQLite) | Market catalog: slug, strike, outcome |
+| `data/archive/*.parquet` | Full 1s history after each window closes |
+| `binance_trades` / `oracle_ticks` / `clob_quotes` | Optional raw tape (`PM_FEED_RECORD=1` only) |
 
-Raw feed recording is **off** by default:
+Raw feed recording is **off** by default. History charts load parquet when SQLite ticks have been pruned.
 
 ```powershell
-$env:PM_FEED_RECORD = "1"
+$env:PM_FEED_RECORD = "1"   # optional debug capture
 .\scripts\run.ps1
+
+python -m pmanalysis prune-db -y --vacuum   # shrink live SQLite; keep parquet
 ```
 
-Windows archive to `data/archive/*.parquet`. SQLite ticks older than 72 hours are pruned.
+Windows archive to `data/archive/*.parquet`. SQLite 1s ticks older than 24 hours are pruned.
 
 ---
 
@@ -95,6 +100,15 @@ Windows archive to `data/archive/*.parquet`. SQLite ticks older than 72 hours ar
 .\scripts\backtest_btc_grid.ps1
 ```
 
+Remote dataset (`/v1` is public; no token):
+
+```powershell
+python scripts/fetch_dataset.py --url http://<collector>:8000 `
+  --start 2026-10-01T00:00:00Z --end 2026-10-27T00:00:00Z --asset BTC --interval 5m
+```
+
+Contract for the backtest app: **[docs/history-dataset.md](docs/history-dataset.md)**
+
 ---
 
 ## Config
@@ -102,13 +116,13 @@ Windows archive to `data/archive/*.parquet`. SQLite ticks older than 72 hours ar
 ```powershell
 $env:PM_PORT = "8000"
 $env:PM_HOST = "127.0.0.1"          # default is 0.0.0.0
-$env:PM_ADMIN_PASSWORD = "..."      # set this on a VPS
+$env:PM_FEED_RECORD = "0"           # default; set 1 only for raw History tabs
+$env:PM_TICK_RETENTION_HOURS = "24"
 .\scripts\web.ps1
 ```
 
 ```text
-python -m pmanalysis clear-db              # wipe collected data
-python -m pmanalysis clear-db -y --keep-archives
+python -m pmanalysis prune-db -y --vacuum  # keep windows + parquet; drop raw + old ticks
 ```
 
 Research tool only — no trading, no financial advice.
