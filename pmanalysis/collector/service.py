@@ -6,7 +6,10 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 
+from pmanalysis.candles import CandleBook, hydrate_book, persist_candles
 from pmanalysis.collector.feed_recorder import FeedRecorder
+from pmanalysis.collector.gaps import GapTracker
+from pmanalysis.collector.health import build_feed_row
 from pmanalysis.collector.live_emitter import build_live_tick
 from pmanalysis.collector.sampler import TickSampler
 from pmanalysis.collector.window_cache import CachedWindow
@@ -18,10 +21,13 @@ from pmanalysis.config import (
     COLLECTOR_TICK_INTERVAL_SEC,
     DISCOVERY_INTERVAL_SEC,
     FEED_RECORD_ENABLED,
+    FEED_HEALTH_INTERVAL_SEC,
     LIVE_PUSH_MIN_INTERVAL_MS,
     OPENING_CAPTURE_DEBOUNCE_SEC,
     QUOTE_PUSH_INTERVAL_SEC,
     RETENTION_SWEEP_INTERVAL_SEC,
+    ROLL_PREFETCH_SEC,
+    ROLL_WATCH_INTERVAL_SEC,
     STRIKE_POLL_INTERVAL_SEC,
     WINDOW_ROLL_GRACE_SEC,
 )
@@ -44,8 +50,13 @@ class CollectorService:
         self.binance = BinanceFeed()
         self.clob = ClobFeed()
         self.window_manager = WindowManager(self.gamma)
+        self.candles = CandleBook()
         self.sampler = TickSampler(
-            self.window_manager, self.chainlink, self.clob, self.binance, self.live_store
+            self.window_manager,
+            self.chainlink,
+            self.clob,
+            binance=self.binance,
+            live_store=self.live_store,
         )
         self._tasks: list[asyncio.Task] = []
         self._token_ids: list[str] = []
@@ -62,6 +73,8 @@ class CollectorService:
         self._price_flush_task: asyncio.Task | None = None
         self._db_worker = DbWriteWorker("collector-db")
         self._feed_recorder = FeedRecorder(self._db_worker)
+        self._gap_tracker = GapTracker()
+        self._feed_snapshot: list[dict] = []
         self._opening_worker = CoalescingWorker(
             "opening-capture",
             self._capture_openings_for_asset,
@@ -81,11 +94,14 @@ class CollectorService:
         with get_session() as session:
             self.window_manager.load_active_from_db(session)
             self._refresh_token_map(session)
+            hydrate_book(session, self.candles, self.window_manager.get_active_windows(session))
 
         self._db_worker.start()
         if FEED_RECORD_ENABLED:
             self._feed_recorder.start()
         self._running = True
+        with get_session() as session:
+            self._gap_tracker.hydrate(session)
         await self._discover_once()
         self._tasks = [
             asyncio.create_task(
@@ -105,6 +121,7 @@ class CollectorService:
             asyncio.create_task(self._roll_watch_loop(), name="roll-watch"),
             asyncio.create_task(self._retention_loop(), name="retention"),
             asyncio.create_task(self._stats_cache_loop(), name="stats-cache"),
+            asyncio.create_task(self._feed_health_loop(), name="feed-health"),
         ]
         log.info(
             "Collector started with %d windows, %d token subscriptions (feed_record=%s)",
@@ -183,7 +200,28 @@ class CollectorService:
             self._refresh_token_map(session)
             self.window_manager.seed_openings_from_previous(session, self.chainlink)
             self._refresh_window_cache(session)
+            self._token_ids = token_ids
         return token_ids, rolled
+
+    def _roll_to_clock_sync(self, now_ts: int) -> list[tuple[str, str, int | None]]:
+        with get_session() as session:
+            rolled = self.window_manager.roll_to_clock(session, now_ts, self.chainlink)
+            if rolled:
+                self._refresh_token_map(session)
+                self._token_ids = self.window_manager.subscription_token_ids(session, now_ts)
+                self._refresh_window_cache(session)
+            return rolled
+
+    def _need_prefetch_sync(self) -> bool:
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        with get_session() as session:
+            return self.window_manager.needs_prefetch(session, now_ts, ROLL_PREFETCH_SEC)
+
+    def _refresh_token_ids_sync(self, now_ts: int) -> list[str]:
+        with get_session() as session:
+            tokens = self.window_manager.subscription_token_ids(session, now_ts)
+            self._token_ids = tokens
+            return tokens
 
     async def _refresh_openings_after_discover(self) -> None:
         try:
@@ -192,19 +230,47 @@ class CollectorService:
             log.warning("post-discover opening refresh failed: %r", exc, exc_info=True)
 
     async def _roll_watch_loop(self) -> None:
-        """Discover the next window as soon as the current one ends."""
+        """Swap to the clock bucket immediately; Gamma fills tokens in the background."""
+        last_prefetch = asyncio.get_running_loop().time()
         while self._running:
             try:
                 now_ts = int(datetime.now(timezone.utc).timestamp())
-                need = await self._db_worker.run(
-                    "roll-check",
-                    lambda: self._needs_roll_discovery_sync(now_ts),
+                prev_tokens = list(self._token_ids)
+                rolled = await self._db_worker.run(
+                    "clock-roll",
+                    lambda: self._roll_to_clock_sync(now_ts),
                 )
-                if need:
-                    await self._discover_once()
+                tokens = await self._db_worker.run(
+                    "sub-tokens",
+                    lambda: self._refresh_token_ids_sync(now_ts),
+                )
+                if rolled:
+                    for asset, interval, prev_window_id in rolled:
+                        await self.live_store.clear_history(asset, interval)
+                        self._last_live_push_ms.pop(f"{asset}:{interval}", None)
+                        self.sampler.drop_state(prev_window_id)
+                        from pmanalysis.web.sync import invalidate_history_cache
+
+                        invalidate_history_cache(asset, interval)
+                    await self._push_all_active_windows()
+                    last_prefetch = 0.0
+                if tokens != prev_tokens or rolled:
+                    if tokens:
+                        try:
+                            await self.clob.seed_tokens(tokens)
+                        except Exception as exc:
+                            log.warning("CLOB seed failed: %r", exc)
+                now_mono = asyncio.get_running_loop().time()
+                if now_mono - last_prefetch >= 5:
+                    need = await self._db_worker.run(
+                        "need-prefetch", self._need_prefetch_sync
+                    )
+                    if need:
+                        last_prefetch = now_mono
+                        await self._discover_once()
             except Exception as exc:
                 log.warning("roll watch failed: %r", exc, exc_info=True)
-            await asyncio.sleep(2)
+            await asyncio.sleep(ROLL_WATCH_INTERVAL_SEC)
 
     async def _push_all_active_windows(self) -> None:
         for window_id in list(self._active_window_ids):
@@ -215,11 +281,13 @@ class CollectorService:
 
     async def _discovery_loop(self) -> None:
         while self._running:
+            await asyncio.sleep(DISCOVERY_INTERVAL_SEC)
+            if not self._running:
+                break
             try:
                 await self._discover_once()
             except Exception as exc:
                 log.warning("discovery failed: %r", exc, exc_info=True)
-            await asyncio.sleep(DISCOVERY_INTERVAL_SEC)
 
     def _needs_roll_discovery_sync(self, now_ts: int) -> bool:
         with get_session() as session:
@@ -291,7 +359,12 @@ class CollectorService:
 
     def _sample_sync(self):
         with get_session() as session:
-            return self.sampler.sample_all(session)
+            samples = self.sampler.sample_all(session)
+        dirty = self.candles.take_dirty()
+        if dirty:
+            with get_session() as session:
+                persist_candles(session, dirty)
+        return samples
 
     async def _finalize_loop(self) -> None:
         while self._running:
@@ -304,30 +377,66 @@ class CollectorService:
             await asyncio.sleep(5)
 
     async def _retention_loop(self) -> None:
-        """Periodically prune SQLite ticks/indicators already safe in parquet.
+        """Keep SQLite bounded: 1s ticks past retention, no raw-feed pile-up.
 
-        Keeps the live DB bounded regardless of how long the process runs; full
-        history stays available via data/archive/*.parquet for backtesting.
+        Full window history stays in data/archive/*.parquet (UI and backtests
+        fall back to it when SQLite ticks have been pruned).
         """
-        from pmanalysis.db.cleanup import checkpoint_wal, purge_archived_ticks
+        from pmanalysis.db.cleanup import run_retention
 
         # Stagger the first sweep so it doesn't compete with collector startup.
         await asyncio.sleep(120)
         while self._running:
             try:
-                await self._db_worker.run(
-                    "retention-purge", lambda: purge_archived_ticks()
-                )
-                await self._db_worker.run("wal-checkpoint", checkpoint_wal)
+                await self._db_worker.run("retention", run_retention)
             except Exception as exc:
                 log.warning("retention sweep failed: %r", exc, exc_info=True)
             await asyncio.sleep(RETENTION_SWEEP_INTERVAL_SEC)
+
+    def snapshot_feeds(self) -> list[dict]:
+        """In-memory feed health for /status (does not touch SQLite)."""
+        clob_idle = not self._token_ids
+        return [
+            build_feed_row(
+                "binance",
+                connected=self.binance.connected,
+                lag_sec=self.binance.last_event_age_sec(),
+            ),
+            build_feed_row(
+                "chainlink",
+                connected=self.chainlink.connected,
+                lag_sec=self.chainlink.last_event_age_sec(),
+            ),
+            build_feed_row(
+                "clob",
+                connected=False if clob_idle else self.clob.connected,
+                lag_sec=None if clob_idle else self.clob.last_event_age_sec(),
+                idle=clob_idle,
+            ),
+        ]
+
+    async def _feed_health_loop(self) -> None:
+        """Classify feed lag and persist CollectorGap open/close transitions."""
+        await asyncio.sleep(3)
+        while self._running:
+            try:
+                snapshot = self.snapshot_feeds()
+                self._feed_snapshot = snapshot
+
+                def _persist():
+                    with get_session() as session:
+                        self._gap_tracker.reconcile(session, snapshot)
+
+                await self._db_worker.run("feed-gaps", _persist)
+            except Exception as exc:
+                log.warning("feed health loop failed: %r", exc, exc_info=True)
+            await asyncio.sleep(FEED_HEALTH_INTERVAL_SEC)
 
     async def _stats_cache_loop(self) -> None:
         """Compute /status + /api/feeds/stats data on the DB worker, on a fixed
         cadence, so HTTP requests read a plain dict instead of querying SQLite
         (and stalling behind the collector's writes) on every page load."""
-        from pmanalysis.db.repository import db_stats
+        from pmanalysis.db.repository import collector_status_payload
         from pmanalysis.db.session import db_health
 
         while self._running:
@@ -335,10 +444,20 @@ class CollectorService:
                 def _load():
                     health = db_health()
                     with get_session() as session:
-                        stats = db_stats(session)
-                    return {**health, **stats}
+                        payload = collector_status_payload(session)
+                    return {**health, **payload}
 
-                self.stats_cache = await self._db_worker.run("stats-cache", _load)
+                cached = await self._db_worker.run("stats-cache", _load)
+                cached["feeds"] = self._feed_snapshot or self.snapshot_feeds()
+                cached["last_tick_at"] = (
+                    self.last_tick_at.isoformat() if self.last_tick_at else None
+                )
+                cached["last_discovery_at"] = (
+                    self.last_discovery_at.isoformat() if self.last_discovery_at else None
+                )
+                cached["feed_record"] = FEED_RECORD_ENABLED
+                cached["collector_running"] = True
+                self.stats_cache = cached
             except Exception as exc:
                 log.warning("stats cache refresh failed: %r", exc, exc_info=True)
             await asyncio.sleep(10)
@@ -605,6 +724,7 @@ class CollectorService:
             return
 
         ts_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        self._note_candle(window)
         key = f"{window.asset}:{window.interval}"
         last = self._last_live_push_ms.get(key, 0)
         if LIVE_PUSH_MIN_INTERVAL_MS > 0 and ts_ms - last < LIVE_PUSH_MIN_INTERVAL_MS:
@@ -624,4 +744,17 @@ class CollectorService:
         if not built:
             return
         card, point = built
+        self._note_candle(window, card)
         await self.live_store.push_tick(card.asset, card.interval, card, point)
+
+    def _note_candle(self, window: CachedWindow, card=None) -> None:
+        price = None
+        open_px = window.opening_oracle_price or window.strike_price
+        if card is not None:
+            price = card.oracle_price if card.oracle_price is not None else card.twap_oracle
+            open_px = card.twap_initial or card.opening_oracle_price or card.strike_price or open_px
+        elif self.chainlink:
+            price = self.chainlink.get_price(window.asset)
+        if price is None or not window.start_ts:
+            return
+        self.candles.update(window.asset, window.interval, window.start_ts, price, open_px)

@@ -163,10 +163,20 @@ class ClobFeed:
         self._prices: dict[str, dict[str, float]] = {}
         self._last_update: dict[str, float] = {}
         self._running = False
+        self._connected = False
 
     @property
     def prices(self) -> dict[str, dict[str, float]]:
         return self._prices
+
+    @property
+    def connected(self) -> bool:
+        return self._connected
+
+    def last_event_age_sec(self) -> float | None:
+        if not self._last_update:
+            return None
+        return time.monotonic() - max(self._last_update.values())
 
     async def close(self) -> None:
         self._running = False
@@ -234,6 +244,28 @@ class ClobFeed:
             "custom_feature_enabled": True,
         })
 
+    def unsubscribe_msg(self, token_ids: list[str]) -> str:
+        return json.dumps({
+            "assets_ids": token_ids,
+            "operation": "unsubscribe",
+        })
+
+    async def _align_subscriptions(
+        self,
+        ws,
+        subscribed: set[str],
+        get_token_ids: Callable[[], list[str]],
+    ) -> None:
+        wanted = set(get_token_ids())
+        missing = wanted - subscribed
+        extra = subscribed - wanted
+        if missing:
+            await ws.send(self.dynamic_subscribe_msg(list(missing)))
+            subscribed.update(missing)
+        if extra:
+            await ws.send(self.unsubscribe_msg(list(extra)))
+            subscribed.difference_update(extra)
+
     async def _ping_loop(self, ws) -> None:
         while self._running:
             try:
@@ -260,12 +292,14 @@ class ClobFeed:
                     await ws.send(self.subscribe_msg(token_ids))
                     subscribed = set(token_ids)
                     backoff = 5
+                    self._connected = True
                     ping_task = asyncio.create_task(self._ping_loop(ws))
                     try:
                         async for raw in ws:
                             if not self._running:
                                 break
                             if raw == "PONG":
+                                await self._align_subscriptions(ws, subscribed, get_token_ids)
                                 continue
                             try:
                                 payload = json.loads(raw)
@@ -288,11 +322,7 @@ class ClobFeed:
                                         "ts_ms": upd.get("ts_ms"),
                                     })
 
-                            new_ids = set(get_token_ids())
-                            missing = new_ids - subscribed
-                            if missing:
-                                await ws.send(self.dynamic_subscribe_msg(list(missing)))
-                                subscribed.update(missing)
+                            await self._align_subscriptions(ws, subscribed, get_token_ids)
 
                             if changed and on_update:
                                 on_update(changed)
@@ -302,6 +332,7 @@ class ClobFeed:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                self._connected = False
                 log.warning("CLOB WS disconnected: %s", exc)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30)

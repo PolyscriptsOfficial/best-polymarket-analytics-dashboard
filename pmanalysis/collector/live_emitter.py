@@ -29,10 +29,8 @@ def build_live_tick(
     ts_ms: int,
     binance: BinanceFeed | None = None,
 ) -> tuple[MarketCard, TickPoint] | None:
-    yes_ask, yes_bid = clob.get_quote(window.yes_token_id)
-    no_ask, no_bid = clob.get_quote(window.no_token_id)
-    if yes_ask <= 0 and yes_bid <= 0 and no_ask <= 0 and no_bid <= 0:
-        return None
+    yes_ask, yes_bid = clob.get_quote(window.yes_token_id) if window.yes_token_id else (0.0, 0.0)
+    no_ask, no_bid = clob.get_quote(window.no_token_id) if window.no_token_id else (0.0, 0.0)
 
     now_ts = int(datetime.now(timezone.utc).timestamp())
     oracle_price = chainlink.get_price(window.asset)

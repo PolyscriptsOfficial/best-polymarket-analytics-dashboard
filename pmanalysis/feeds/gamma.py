@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 import httpx
 
 from pmanalysis.config import DISCOVERY_LOOKAHEAD_MINUTES, GAMMA_API, INTERVAL_SECONDS, MARKET_SLUGS
-from pmanalysis.feeds.slugs import build_market_slug
+from pmanalysis.feeds.slugs import boundary_ts, build_market_slug, start_ts_from_slug
 
 log = logging.getLogger(__name__)
 _STRIKE_RE = re.compile(r"\$[\d,]+(?:\.\d+)?")
@@ -51,6 +51,7 @@ class DiscoveredWindow:
     start_ts: int
     end_ts: int
     secs_left: int
+    role: str = "current"
 
 
 class GammaClient:
@@ -64,21 +65,40 @@ class GammaClient:
         await self._client.aclose()
 
     async def discover_active_windows(self) -> list[DiscoveredWindow]:
-        """Discover live windows by direct slug fetch (reliable) + bulk scan fallback."""
+        """Fetch the clock-current slug and the next slug for CLOB overlap.
+
+        Gamma `active` is not required: the next market is often created before
+        it is marked active. Clock roll must not wait on that flag.
+        """
         out: list[DiscoveredWindow] = []
         seen_slugs: set[str] = set()
+        now_ts = int(datetime.now(timezone.utc).timestamp())
 
-        async def fetch_direct(asset: str, interval: str, base_slug: str) -> DiscoveredWindow | None:
-            slug = build_market_slug(asset, interval)
+        async def fetch_direct(
+            asset: str, interval: str, base_slug: str, when_ts: int, role: str
+        ) -> DiscoveredWindow | None:
+            slug = build_market_slug(asset, interval, when_ts)
             market = await self.fetch_market_by_slug(slug)
-            if not market or not market.get("active"):
+            if not market:
                 return None
-            return self._parse_market(asset, interval, base_slug, market)
+            parsed = self._parse_market(asset, interval, base_slug, market)
+            if parsed:
+                parsed.role = role
+                start = boundary_ts(when_ts, interval)
+                parsed.start_ts = start
+                parsed.end_ts = start + INTERVAL_SECONDS[interval]
+            return parsed
 
-        direct = await asyncio.gather(
-            *[fetch_direct(asset, interval, base) for asset, interval, base in MARKET_SLUGS],
-            return_exceptions=True,
-        )
+        jobs = []
+        for asset, interval, base in MARKET_SLUGS:
+            jobs.append(fetch_direct(asset, interval, base, now_ts, "current"))
+            jobs.append(
+                fetch_direct(
+                    asset, interval, base, now_ts + INTERVAL_SECONDS[interval], "next"
+                )
+            )
+
+        direct = await asyncio.gather(*jobs, return_exceptions=True)
         for result in direct:
             if isinstance(result, BaseException):
                 log.warning(
@@ -91,10 +111,19 @@ class GammaClient:
                 out.append(result)
                 seen_slugs.add(result.slug)
 
-        if not out:
-            out.extend(await self._discover_bulk())
+        if not any(item.role == "current" for item in out):
+            for item in await self._discover_bulk():
+                if item.slug not in seen_slugs:
+                    item.role = "current"
+                    out.append(item)
+                    seen_slugs.add(item.slug)
 
-        log.info("Discovered %d active windows", len(out))
+        log.info(
+            "Discovered %d windows (%d current, %d next)",
+            len(out),
+            sum(1 for item in out if item.role == "current"),
+            sum(1 for item in out if item.role == "next"),
+        )
         return out
 
     async def _discover_bulk(self) -> list[DiscoveredWindow]:
@@ -147,33 +176,39 @@ class GammaClient:
         if len(tokens) < 2:
             return None
 
-        end_ts = 0
-        secs_left = 0
-        try:
-            end_dt = datetime.fromisoformat(market.get("endDate", "").replace("Z", "+00:00"))
-            end_ts = int(end_dt.timestamp())
-            secs_left = max(0, int((end_dt - datetime.now(timezone.utc)).total_seconds()))
-        except (TypeError, ValueError):
-            pass
-
-        if end_ts <= int(datetime.now(timezone.utc).timestamp()):
-            return None
-
-        start_ts = 0
-        try:
-            est = market.get("eventStartTime", "")
-            if est:
-                start_ts = int(
-                    datetime.fromisoformat(est.replace("Z", "+00:00")).timestamp()
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        slug = market.get("slug") or build_market_slug(asset, interval)
+        start_ts = start_ts_from_slug(slug) or 0
+        end_ts = start_ts + INTERVAL_SECONDS[interval] if start_ts else 0
+        if not start_ts:
+            try:
+                est = market.get("eventStartTime", "")
+                if est:
+                    start_ts = int(
+                        datetime.fromisoformat(est.replace("Z", "+00:00")).timestamp()
+                    )
+            except (TypeError, ValueError):
+                start_ts = 0
+            try:
+                end_dt = datetime.fromisoformat(
+                    market.get("endDate", "").replace("Z", "+00:00")
                 )
-        except (TypeError, ValueError):
-            start_ts = end_ts - INTERVAL_SECONDS[interval] if end_ts else 0
+                end_ts = int(end_dt.timestamp())
+            except (TypeError, ValueError):
+                end_ts = 0
+            if start_ts and not end_ts:
+                end_ts = start_ts + INTERVAL_SECONDS[interval]
+            elif end_ts and not start_ts:
+                start_ts = end_ts - INTERVAL_SECONDS[interval]
+
+        if end_ts and end_ts <= now_ts:
+            return None
 
         return DiscoveredWindow(
             asset=asset,
             interval=interval,
             base_slug=base_slug,
-            slug=market.get("slug", build_market_slug(asset, interval)),
+            slug=slug,
             condition_id=market.get("conditionId", "") or "",
             yes_token_id=str(tokens[0]),
             no_token_id=str(tokens[1]),
@@ -181,7 +216,7 @@ class GammaClient:
             strike_label=parse_strike(market.get("question", "")),
             start_ts=start_ts,
             end_ts=end_ts,
-            secs_left=secs_left,
+            secs_left=max(0, end_ts - now_ts) if end_ts else 0,
         )
 
     async def fetch_strike(self, slug: str) -> tuple[float | None, str | None]:

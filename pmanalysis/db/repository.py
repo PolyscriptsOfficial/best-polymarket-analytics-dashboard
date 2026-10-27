@@ -7,9 +7,10 @@ from datetime import datetime, timezone
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from pmanalysis.config import ASSETS, INTERVALS
-from pmanalysis.db.models import Indicator, Tick, Window
-from pmanalysis.indicators.compute import win_rate
+from pmanalysis.config import ASSETS, INTERVALS, FEED_RECORD_ENABLED
+from pmanalysis.collector.health import FEED_SOURCES, build_feed_row
+from pmanalysis.db.models import CollectorGap, Indicator, Tick, Window
+from pmanalysis.db.series import load_window_series, preview_points, tick_payload_points
 from pmanalysis.schemas import MarketCard, WindowSummary
 
 
@@ -18,20 +19,11 @@ def _now_ts() -> int:
 
 
 def latest_oracle_prices(session: Session) -> dict[str, float]:
-    """Prefer oracle_ticks (indexed); fall back to sampled ticks if empty."""
+    """Latest oracle per asset from 1s ticks; raw oracle_ticks only if feed-record is on."""
     from pmanalysis.db.models import OracleTick
 
     out: dict[str, float] = {}
     for asset in ASSETS:
-        row = (
-            session.query(OracleTick.price)
-            .filter(OracleTick.asset == asset)
-            .order_by(OracleTick.ts_ms.desc())
-            .first()
-        )
-        if row and row[0] is not None:
-            out[asset] = float(row[0])
-            continue
         tick_row = (
             session.query(Tick.oracle_price)
             .join(Window, Tick.window_id == Window.id)
@@ -41,6 +33,17 @@ def latest_oracle_prices(session: Session) -> dict[str, float]:
         )
         if tick_row and tick_row[0] is not None:
             out[asset] = float(tick_row[0])
+            continue
+        if not FEED_RECORD_ENABLED:
+            continue
+        row = (
+            session.query(OracleTick.price)
+            .filter(OracleTick.asset == asset)
+            .order_by(OracleTick.ts_ms.desc())
+            .first()
+        )
+        if row and row[0] is not None:
+            out[asset] = float(row[0])
     return out
 
 
@@ -273,7 +276,17 @@ def db_stats(session: Session) -> dict:
         "oracle_tick_count": _approx_rows(OracleTick),
         "clob_quote_count": _approx_rows(ClobQuote),
         "latest_tick": latest_tick,
+        "latest_binance_ts": _latest_ts(session, BinanceTrade, "ts_ms"),
+        "latest_oracle_ts": _latest_ts(session, OracleTick, "ts_ms"),
+        "latest_clob_ts": _latest_ts(session, ClobQuote, "ts_ms"),
     }
+
+
+def _latest_ts(session: Session, model, ts_attr: str) -> int | None:
+    row_id = session.query(func.max(model.id)).scalar()
+    if not row_id:
+        return None
+    return session.query(getattr(model, ts_attr)).filter(model.id == row_id).scalar()
 
 
 def list_binance_trades(
@@ -386,45 +399,14 @@ def window_preview_payload(
     slug: str,
     *,
     max_points: int = 64,
+    window: Window | None = None,
 ) -> dict | None:
     """Lightweight downsampled YES/NO series for sidebar previews."""
-    window = session.query(Window).filter_by(slug=slug).first()
+    window = window or session.query(Window).filter_by(slug=slug).first()
     if not window:
         return None
-    rows = (
-        session.query(Tick.ts_ms, Tick.yes_ask, Tick.no_ask, Tick.yes_mid, Tick.no_mid)
-        .filter_by(window_id=window.id)
-        .order_by(Tick.ts_ms)
-        .all()
-    )
-    if not rows:
-        points: list[dict] = []
-    elif len(rows) <= max_points:
-        points = [
-            {
-                "ts_ms": r.ts_ms,
-                "yes_ask": r.yes_ask,
-                "no_ask": r.no_ask,
-                "yes_mid": r.yes_mid,
-                "no_mid": r.no_mid,
-            }
-            for r in rows
-        ]
-    else:
-        step = max(1, len(rows) // max_points)
-        sampled = list(rows[::step])
-        if sampled[-1] is not rows[-1]:
-            sampled.append(rows[-1])
-        points = [
-            {
-                "ts_ms": r.ts_ms,
-                "yes_ask": r.yes_ask,
-                "no_ask": r.no_ask,
-                "yes_mid": r.yes_mid,
-                "no_mid": r.no_mid,
-            }
-            for r in sampled
-        ]
+    rows = load_window_series(session, window)
+    points = preview_points(rows, max_points)
     return {
         "window": {
             "slug": window.slug,
@@ -449,20 +431,28 @@ def list_recent_previews(
     page: int = 0,
     skip_current: bool = False,
     max_points: int = 64,
+    now_ts: int | None = None,
 ) -> dict:
     """Paginated recent windows with downsampled chart points.
 
-    When skip_current=True, the newest (live/current) window is excluded so the
+    The prefetched *next* market (start_ts in the future) is excluded — it has
+    no ticks yet and showed up as a blank OPEN card above the live window.
+    When skip_current=True, the live/current window is also excluded so the
     sidebar starts at the previous market.
     """
     limit = max(1, min(int(limit), 10))
     page = max(0, int(page))
     base_skip = 1 if skip_current else 0
     offset = base_skip + page * limit
+    now_ts = now_ts if now_ts is not None else _now_ts()
 
     q = (
         session.query(Window)
-        .filter(Window.asset == asset.upper(), Window.interval == interval)
+        .filter(
+            Window.asset == asset.upper(),
+            Window.interval == interval,
+            Window.start_ts <= now_ts,
+        )
         .order_by(Window.end_ts.desc())
     )
     # Fetch one extra to know if older pages exist.
@@ -472,7 +462,9 @@ def list_recent_previews(
 
     items: list[dict] = []
     for window in windows:
-        payload = window_preview_payload(session, window.slug, max_points=max_points)
+        payload = window_preview_payload(
+            session, window.slug, max_points=max_points, window=window
+        )
         if payload:
             items.append(payload)
 
@@ -490,16 +482,7 @@ def window_ticks_payload(session: Session, slug: str) -> dict | None:
     window = session.query(Window).filter_by(slug=slug).first()
     if not window:
         return None
-    ticks = (
-        session.query(Tick)
-        .filter_by(window_id=window.id)
-        .order_by(Tick.ts_ms)
-        .all()
-    )
-    indicators = {
-        row.ts_ms: row
-        for row in session.query(Indicator).filter_by(window_id=window.id).all()
-    }
+    rows = load_window_series(session, window)
     return {
         "window": {
             "slug": window.slug,
@@ -511,39 +494,129 @@ def window_ticks_payload(session: Session, slug: str) -> dict | None:
             "opening_oracle_price": opening_oracle_price(session, window),
             "outcome": window.outcome,
         },
-        "ticks": [
-            {
-                "ts_ms": t.ts_ms,
-                "oracle_price": t.oracle_price,
-                "binance_price": t.binance_price,
-                "yes_mid": t.yes_mid,
-                "no_mid": t.no_mid,
-                "yes_ask": t.yes_ask,
-                "no_ask": t.no_ask,
-                "combined_ask": t.combined_ask,
-                "dist_from_strike": t.dist_from_strike,
-                "arb_edge": indicators[t.ts_ms].arb_edge if t.ts_ms in indicators else None,
-                "twap_oracle": (
-                    getattr(indicators[t.ts_ms], "twap_oracle", None)
-                    if t.ts_ms in indicators
-                    else None
-                ),
-            }
-            for t in ticks
-        ],
+        "ticks": tick_payload_points(rows),
     }
 
 
-def stats_win_rate(session: Session, asset: str, interval: str) -> float | None:
+def stats_win_rates(session: Session) -> list[dict]:
+    """All-time UP/DOWN rates per asset × interval (GROUP BY, not a full scan of ticks)."""
     rows = (
-        session.query(Window.outcome)
-        .filter(
-            Window.asset == asset.upper(),
-            Window.interval == interval,
-            Window.outcome.isnot(None),
-        )
-        .order_by(Window.end_ts.desc())
-        .limit(50)
+        session.query(Window.asset, Window.interval, Window.outcome, func.count())
+        .filter(Window.outcome.in_(("UP", "DOWN")))
+        .group_by(Window.asset, Window.interval, Window.outcome)
         .all()
     )
-    return win_rate([row[0] for row in rows if row[0]])
+    counts: dict[tuple[str, str], dict[str, int]] = {}
+    for asset, interval, outcome, n in rows:
+        bucket = counts.setdefault((asset.upper(), interval), {"UP": 0, "DOWN": 0})
+        bucket[str(outcome)] = int(n)
+
+    out: list[dict] = []
+    for asset in ASSETS:
+        for interval in INTERVALS:
+            bucket = counts.get((asset, interval), {"UP": 0, "DOWN": 0})
+            up, down = bucket["UP"], bucket["DOWN"]
+            resolved = up + down
+            rate = round(up / resolved * 100, 1) if resolved else None
+            out.append(
+                {
+                    "asset": asset,
+                    "interval": interval,
+                    "win_rate_up_pct": rate,
+                    "resolved": resolved,
+                    "up": up,
+                    "down": down,
+                }
+            )
+    return out
+
+
+def stats_for_market(session: Session, asset: str, interval: str) -> dict | None:
+    asset = asset.upper()
+    if asset not in ASSETS or interval not in INTERVALS:
+        return None
+    for row in stats_win_rates(session):
+        if row["asset"] == asset and row["interval"] == interval:
+            return row
+    return None
+
+
+def stats_win_rate(session: Session, asset: str, interval: str) -> float | None:
+    row = stats_for_market(session, asset, interval)
+    return None if row is None else row["win_rate_up_pct"]
+
+
+def _aware(dt: datetime | None) -> datetime | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def serialize_gap(row: CollectorGap) -> dict:
+    started = _aware(row.started_at)
+    ended = _aware(row.ended_at)
+    now = datetime.now(timezone.utc)
+    duration = None
+    if started is not None:
+        duration = round(((ended or now) - started).total_seconds(), 1)
+    return {
+        "id": row.id,
+        "source": row.source,
+        "started_at": started.isoformat() if started else None,
+        "ended_at": ended.isoformat() if ended else None,
+        "message": row.message or "",
+        "duration_sec": duration,
+        "open": ended is None,
+    }
+
+
+def list_collector_gaps(
+    session: Session,
+    *,
+    open_only: bool = False,
+    limit: int = 20,
+) -> list[dict]:
+    query = session.query(CollectorGap)
+    if open_only:
+        rows = (
+            query.filter(CollectorGap.ended_at.is_(None))
+            .order_by(CollectorGap.started_at.desc())
+            .all()
+        )
+    else:
+        rows = query.order_by(CollectorGap.started_at.desc()).limit(max(1, limit)).all()
+    return [serialize_gap(row) for row in rows]
+
+
+def feeds_from_db(session: Session) -> list[dict]:
+    """Infer lag from the newest raw-feed rows (split web process / no collector)."""
+    stats = db_stats(session)
+    now_ms = datetime.now(timezone.utc).timestamp() * 1000
+    ts_by_source = {
+        "binance": stats.get("latest_binance_ts"),
+        "chainlink": stats.get("latest_oracle_ts"),
+        "clob": stats.get("latest_clob_ts"),
+    }
+    out: list[dict] = []
+    for source in FEED_SOURCES:
+        ts_ms = ts_by_source[source]
+        lag_sec = None if ts_ms is None else max(0.0, (now_ms - int(ts_ms)) / 1000.0)
+        row = build_feed_row(
+            source,
+            connected=None if ts_ms is None else True,
+            lag_sec=lag_sec,
+            origin="db",
+        )
+        out.append(row)
+    return out
+
+
+def collector_status_payload(session: Session) -> dict:
+    stats = db_stats(session)
+    return {
+        **stats,
+        "gaps_open": list_collector_gaps(session, open_only=True),
+        "gaps_recent": list_collector_gaps(session, open_only=False, limit=12),
+    }

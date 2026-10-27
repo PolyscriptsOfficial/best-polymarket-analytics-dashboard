@@ -8,6 +8,7 @@ import logging
 import time
 from typing import Callable
 
+import httpx
 import websockets
 
 from pmanalysis.config import ASSETS
@@ -22,13 +23,13 @@ _SYMBOLS = {
 _ASSET_FOR_SYMBOL = {v.upper(): k for k, v in _SYMBOLS.items()}
 
 
-def _stream_url() -> str:
+def _combined_stream_url(host: str) -> str:
     streams = "/".join(f"{sym}@trade" for sym in _SYMBOLS.values())
-    return f"wss://stream.binance.com:9443/stream?streams={streams}"
+    return f"{host}/stream?streams={streams}"
 
 
-def parse_trade_msg(raw: str) -> dict | None:
-    """Parse a Binance combined-stream trade message."""
+def parse_trade_msg(raw: str, *, source: str = "binance") -> dict | None:
+    """Parse a Binance combined-stream spot trade message."""
     raw = (raw or "").strip()
     if not raw:
         return None
@@ -67,16 +68,36 @@ def parse_trade_msg(raw: str) -> dict | None:
         "ts_ms": ts_ms,
         "qty": qty,
         "trade_id": str(trade_id) if trade_id is not None else None,
-        "source": "binance",
+        "source": source,
     }
 
 
 class BinanceFeed:
+    """Binance USDT spot last-trade overlay (not used for settlement)."""
+
+    STREAM_HOST = "wss://stream.binance.com:9443"
+    # stream.binance.com returns HTTP 451 from some regions; vision is market-data only.
+    STREAM_HOSTS = (
+        "wss://data-stream.binance.vision:443",
+        "wss://stream.binance.com:9443",
+        "wss://stream.binance.com:443",
+    )
+    REST_TICKER_URLS = (
+        "https://data-api.binance.vision/api/v3/ticker/price",
+        "https://api.binance.com/api/v3/ticker/price",
+    )
+    REST_POLL_SEC = 0.5
+    SOURCE = "binance"
+    PRICE_KEY = "binance_price"
+    LOG_NAME = "Binance spot trade feed"
+
     def __init__(self) -> None:
         self._prices: dict[str, float] = {}
         self._history: dict[str, list[tuple[int, float]]] = {a: [] for a in ASSETS}
         self._running = False
-        self._connected = False
+        self._ws_connected = False
+        self._rest_connected = False
+        self._last_event_ts = 0.0
         self._on_tick: Callable[[dict], None] | None = None
 
     @property
@@ -85,10 +106,15 @@ class BinanceFeed:
 
     @property
     def connected(self) -> bool:
-        return self._connected
+        return self._ws_connected or self._rest_connected
 
     def get_price(self, asset: str) -> float | None:
         return self._prices.get(asset)
+
+    def last_event_age_sec(self) -> float | None:
+        if not self._last_event_ts:
+            return None
+        return time.time() - self._last_event_ts
 
     def history(self, asset: str, max_points: int = 1200) -> list[tuple[int, float]]:
         return self._history.get(asset, [])[-max_points:]
@@ -100,6 +126,7 @@ class BinanceFeed:
         asset = tick["asset"]
         price = tick["price"]
         ts_ms = tick.get("ts_ms") or int(time.time() * 1000)
+        self._last_event_ts = time.time()
         self._prices[asset] = price
         hist = self._history.setdefault(asset, [])
         hist.append((ts_ms, price))
@@ -137,53 +164,130 @@ class BinanceFeed:
             if price is None:
                 return []
             now_ms = int(time.time() * 1000)
-            return [{"ts_ms": now_ms, "binance_price": price}]
+            return [{"ts_ms": now_ms, self.PRICE_KEY: price}]
 
         start_ms = start_ts * 1000
         end_ms = end_ts * 1000
         points: list[dict] = []
         for ts_ms, price in hist:
             if start_ms <= ts_ms <= end_ms:
-                points.append({"ts_ms": ts_ms, "binance_price": price})
+                points.append({"ts_ms": ts_ms, self.PRICE_KEY: price})
 
         opening = self._price_at_boundary(hist, start_ts)
         if opening is not None and not any(p["ts_ms"] == start_ms for p in points):
-            points.insert(0, {"ts_ms": start_ms, "binance_price": opening})
+            points.insert(0, {"ts_ms": start_ms, self.PRICE_KEY: opening})
 
         if not points and hist:
             last_ts, last_price = hist[-1]
             if last_ts >= start_ms - 60_000:
                 points.append({
                     "ts_ms": max(last_ts, start_ms),
-                    "binance_price": last_price,
+                    self.PRICE_KEY: last_price,
                 })
         return points
+
+    async def _rest_poll_loop(self) -> None:
+        """Keep spot last prices flowing when the trade websocket is geo-blocked."""
+        urls = tuple(self.REST_TICKER_URLS)
+        if not urls:
+            return
+        symbols = [sym.upper() for sym in _SYMBOLS.values()]
+        url_i = 0
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            while self._running:
+                if self._ws_connected:
+                    self._rest_connected = False
+                    await asyncio.sleep(1.0)
+                    continue
+                url = urls[url_i % len(urls)]
+                got = False
+                try:
+                    resp = await client.get(url, params={"symbols": json.dumps(symbols)})
+                    if resp.status_code != 200:
+                        raise RuntimeError(f"HTTP {resp.status_code}")
+                    rows = resp.json()
+                    if not isinstance(rows, list):
+                        rows = [rows]
+                    now_ms = int(time.time() * 1000)
+                    for row in rows:
+                        if not isinstance(row, dict):
+                            continue
+                        asset = _ASSET_FOR_SYMBOL.get(str(row.get("symbol", "")).upper())
+                        if not asset:
+                            continue
+                        try:
+                            price = float(row.get("price", 0))
+                        except (TypeError, ValueError):
+                            continue
+                        if price <= 0:
+                            continue
+                        tick = {
+                            "asset": asset,
+                            "price": price,
+                            "ts_ms": now_ms,
+                            "qty": None,
+                            "trade_id": None,
+                            "source": self.SOURCE,
+                        }
+                        self._apply_tick(tick)
+                        if self._on_tick:
+                            self._on_tick(tick)
+                        got = True
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    log.debug("%s REST poll %s: %s", self.LOG_NAME, url, exc)
+                    url_i += 1
+                self._rest_connected = got
+                await asyncio.sleep(self.REST_POLL_SEC)
 
     async def run(self, on_tick: Callable[[dict], None] | None = None) -> None:
         self._running = True
         self._on_tick = on_tick
+        hosts = list(self.STREAM_HOSTS or (self.STREAM_HOST,))
+        host_i = 0
         backoff = 5
-        url = _stream_url()
-
-        while self._running:
+        rest_task = asyncio.create_task(self._rest_poll_loop(), name=f"{self.SOURCE}-rest")
+        try:
+            while self._running:
+                host = hosts[host_i % len(hosts)]
+                url = _combined_stream_url(host)
+                try:
+                    async with websockets.connect(
+                        url,
+                        ping_interval=20,
+                        ping_timeout=20,
+                        open_timeout=8,
+                    ) as ws:
+                        self._ws_connected = True
+                        backoff = 5
+                        log.info("%s connected (%s)", self.LOG_NAME, host)
+                        async for raw in ws:
+                            if not self._running:
+                                break
+                            tick = parse_trade_msg(raw, source=self.SOURCE)
+                            if not tick:
+                                continue
+                            self._apply_tick(tick)
+                            if self._on_tick:
+                                self._on_tick(tick)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self._ws_connected = False
+                    log.warning("%s disconnected from %s: %s", self.LOG_NAME, host, exc)
+                    host_i += 1
+                    if host_i % len(hosts) == 0:
+                        await asyncio.sleep(backoff)
+                        backoff = min(backoff * 2, 60)
+                    else:
+                        await asyncio.sleep(0.2)
+        finally:
+            rest_task.cancel()
             try:
-                async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
-                    self._connected = True
-                    backoff = 5
-                    log.info("Binance trade feed connected")
-                    async for raw in ws:
-                        if not self._running:
-                            break
-                        tick = parse_trade_msg(raw)
-                        if not tick:
-                            continue
-                        self._apply_tick(tick)
-                        if self._on_tick:
-                            self._on_tick(tick)
+                await rest_task
             except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                self._connected = False
-                log.warning("Binance feed disconnected: %s", exc)
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 60)
+                pass
+            self._ws_connected = False
+            self._rest_connected = False
+

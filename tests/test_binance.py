@@ -19,6 +19,13 @@ def test_parse_binance_trade_message():
     assert tick["asset"] == "BTC"
     assert tick["price"] == 61777.99
     assert tick["ts_ms"] == 1_700_000_000_123
+    assert tick["source"] == "binance"
+
+
+def test_binance_spot_has_geo_fallback_hosts():
+    assert "data-stream.binance.vision" in "".join(BinanceFeed.STREAM_HOSTS)
+    assert BinanceFeed.REST_TICKER_URLS
+    assert "data-api.binance.vision" in BinanceFeed.REST_TICKER_URLS[0]
 
 
 def test_binance_points_for_window():

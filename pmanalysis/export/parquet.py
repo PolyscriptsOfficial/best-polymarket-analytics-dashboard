@@ -7,7 +7,7 @@ from pathlib import Path
 import pandas as pd
 from sqlalchemy.orm import Session
 
-from pmanalysis.config import ARCHIVE_DIR, EXPORT_DIR
+from pmanalysis import config
 from pmanalysis.db.models import Indicator, Tick, Window
 
 
@@ -18,6 +18,11 @@ def _window_frame(session: Session, window: Window) -> pd.DataFrame:
         .order_by(Tick.ts_ms)
         .all()
     )
+    if not ticks:
+        archived = load_window_frame(window)
+        if archived is not None:
+            return archived
+        return pd.DataFrame()
     indicators = {
         row.ts_ms: row
         for row in session.query(Indicator).filter_by(window_id=window.id).all()
@@ -56,7 +61,7 @@ def _window_frame(session: Session, window: Window) -> pd.DataFrame:
 
 def export_window_parquet(session: Session, window: Window) -> Path:
     frame = _window_frame(session, window)
-    out_dir = ARCHIVE_DIR / window.asset.lower() / window.interval
+    out_dir = config.ARCHIVE_DIR / window.asset.lower() / window.interval
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{window.slug}.parquet"
     frame.to_parquet(out_path, index=False)
@@ -67,14 +72,14 @@ def export_window_parquet(session: Session, window: Window) -> Path:
 
 def export_window_csv(session: Session, window: Window) -> Path:
     frame = _window_frame(session, window)
-    EXPORT_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = EXPORT_DIR / f"{window.slug}.csv"
+    config.EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = config.EXPORT_DIR / f"{window.slug}.csv"
     frame.to_csv(out_path, index=False)
     return out_path
 
 
 def archive_path_for(asset: str, interval: str, slug: str) -> Path:
-    return ARCHIVE_DIR / asset.lower() / interval / f"{slug}.parquet"
+    return config.ARCHIVE_DIR / asset.lower() / interval / f"{slug}.parquet"
 
 
 def load_window_frame(window: Window) -> pd.DataFrame | None:

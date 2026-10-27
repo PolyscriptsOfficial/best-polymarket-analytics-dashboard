@@ -39,6 +39,7 @@ class Window(Base):
     __table_args__ = (
         UniqueConstraint("slug", name="uq_windows_slug"),
         Index("ix_windows_asset_interval_end", "asset", "interval", "end_ts"),
+        Index("ix_windows_asset_interval_start", "asset", "interval", "start_ts"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -79,6 +80,7 @@ class Tick(Base):
     ts_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
     oracle_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     binance_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    binance_perp_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     yes_ask: Mapped[float] = mapped_column(Float, default=0.0)
     yes_bid: Mapped[float] = mapped_column(Float, default=0.0)
     no_ask: Mapped[float] = mapped_column(Float, default=0.0)
@@ -130,6 +132,7 @@ class Candle(Base):
 
 class CollectorGap(Base):
     __tablename__ = "collector_gaps"
+    __table_args__ = (Index("ix_collector_gaps_source_ended", "source", "ended_at"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     source: Mapped[str] = mapped_column(String(32), nullable=False)

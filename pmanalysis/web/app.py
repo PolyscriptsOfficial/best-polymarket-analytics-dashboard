@@ -12,27 +12,32 @@ from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
+from pmanalysis import __version__
 from pmanalysis.collector.registry import get_collector, set_collector
 from pmanalysis.collector.service import CollectorService
-from pmanalysis.config import ADMIN_PASSWORD, ASSETS, INTERVALS, INTERVAL_SECONDS, WEB_HOST, WEB_PORT
+from pmanalysis.config import ASSETS, INTERVALS, INTERVAL_SECONDS, FEED_RECORD_ENABLED, WEB_HOST, WEB_PORT
+from pmanalysis.datasets.service import DatasetService, set_dataset_service
 from pmanalysis.db.models import Window
 from pmanalysis.db.repository import (
     count_windows,
+    collector_status_payload,
     db_stats,
+    feeds_from_db,
     list_binance_trades,
     list_clob_quotes,
     list_oracle_ticks,
     list_recent_previews,
     list_windows,
-    stats_win_rate,
+    stats_for_market,
+    stats_win_rates,
     window_ticks_payload,
 )
-from pmanalysis.db.clear import clear_database
 from pmanalysis.db.session import db_health, get_session, init_db, run_db
 from pmanalysis.export.parquet import export_window_csv
 from pmanalysis.web.render import render
 from pmanalysis.schemas import MarketCard
 from pmanalysis.web.sync import db_sync_loop, hydrate_live_store_from_db
+from pmanalysis.web.datasets import router as datasets_router
 from pmanalysis.web.ws import manager as ws_manager
 
 log = logging.getLogger(__name__)
@@ -46,10 +51,46 @@ def _embed_collector() -> bool:
     return os.getenv("PM_EMBED_COLLECTOR", "0") == "1"
 
 
+def _health_from_status(payload: dict) -> dict:
+    return {
+        "path": payload.get("path"),
+        "size_mb": payload.get("size_mb"),
+        "ok": payload.get("ok"),
+    }
+
+
+async def _status_bundle() -> dict:
+    collector = get_collector()
+    cached = collector.stats_cache if collector else None
+    if cached is not None:
+        return cached
+
+    def _load():
+        health = db_health()
+        with get_session() as session:
+            payload = collector_status_payload(session)
+            feeds = feeds_from_db(session)
+        return {
+            **health,
+            **payload,
+            "feeds": feeds,
+            "feed_record": FEED_RECORD_ENABLED,
+            "collector_running": False,
+            "last_tick_at": None,
+            "last_discovery_at": None,
+        }
+
+    return await run_db(_load)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _collector, _background_tasks
     init_db()
+    dataset_service = DatasetService()
+    app.state.dataset_service = dataset_service
+    set_dataset_service(dataset_service)
+    await dataset_service.start_background()
     await hydrate_live_store_from_db()
     if _embed_collector():
         log.info("Embedded collector enabled (WebSocket streams from live feeds)")
@@ -64,6 +105,9 @@ async def lifespan(app: FastAPI):
         task.cancel()
     await asyncio.gather(*_background_tasks, return_exceptions=True)
     _background_tasks.clear()
+    await dataset_service.stop()
+    set_dataset_service(None)
+    app.state.dataset_service = None
     if _collector:
         await _collector.stop()
         set_collector(None)
@@ -71,7 +115,8 @@ async def lifespan(app: FastAPI):
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="Polymarket Analysis", version="0.2.0", lifespan=lifespan)
+    app = FastAPI(title="Polymarket Analysis", version=__version__, lifespan=lifespan)
+    app.include_router(datasets_router)
     app.mount("/static", StaticFiles(directory=str(WEB_DIR / "static")), name="static")
 
     @app.get("/favicon.ico", include_in_schema=False)
@@ -109,28 +154,38 @@ def create_app() -> FastAPI:
 
     @app.get("/status", response_class=HTMLResponse)
     async def status_page(request: Request):
-        collector = get_collector()
-        cached = collector.stats_cache if collector else None
-        if cached is not None:
-            health = {"path": cached["path"], "size_mb": cached["size_mb"], "ok": cached["ok"]}
-            stats = {k: v for k, v in cached.items() if k not in health}
-        else:
-            # Fallback (no embedded collector yet, or cache not warmed up): may
-            # briefly block behind the SQLite writer on first load only.
-            def _load():
-                health = db_health()
-                with get_session() as session:
-                    stats = db_stats(session)
-                return health, stats
-
-            health, stats = await run_db(_load)
+        payload = await _status_bundle()
+        health = _health_from_status(payload)
         return render(
             request,
             "status.html",
             health=health,
             embed_collector=_embed_collector(),
-            **stats,
+            **payload,
         )
+
+    @app.get("/api/status")
+    async def api_status():
+        payload = await _status_bundle()
+        return {
+            "ok": payload.get("ok"),
+            "path": payload.get("path"),
+            "size_mb": payload.get("size_mb"),
+            "window_count": payload.get("window_count"),
+            "tick_count": payload.get("tick_count"),
+            "binance_trade_count": payload.get("binance_trade_count"),
+            "oracle_tick_count": payload.get("oracle_tick_count"),
+            "clob_quote_count": payload.get("clob_quote_count"),
+            "latest_tick": payload.get("latest_tick"),
+            "feeds": payload.get("feeds") or [],
+            "gaps_open": payload.get("gaps_open") or [],
+            "gaps_recent": payload.get("gaps_recent") or [],
+            "feed_record": payload.get("feed_record"),
+            "collector_running": payload.get("collector_running", False),
+            "embed_collector": _embed_collector(),
+            "last_tick_at": payload.get("last_tick_at"),
+            "last_discovery_at": payload.get("last_discovery_at"),
+        }
 
     @app.websocket("/ws/live")
     async def ws_live(websocket: WebSocket):
@@ -184,11 +239,14 @@ def create_app() -> FastAPI:
                 "oracle_tick_count": cached["oracle_tick_count"],
                 "clob_quote_count": cached["clob_quote_count"],
                 "latest_tick": cached["latest_tick"],
+                "feed_record": cached.get("feed_record", FEED_RECORD_ENABLED),
             }
 
         def _load():
             with get_session() as session:
-                return db_stats(session)
+                stats = db_stats(session)
+            stats["feed_record"] = FEED_RECORD_ENABLED
+            return stats
 
         return await run_db(_load)
 
@@ -250,6 +308,25 @@ def create_app() -> FastAPI:
             raise HTTPException(404, "Window not found")
         return payload
 
+    @app.get("/api/candles/{asset}/{interval}")
+    async def api_candles(asset: str, interval: str, limit: int = 180):
+        asset = asset.upper()
+        if asset not in ASSETS or interval not in INTERVALS:
+            raise HTTPException(400, "Invalid asset or interval")
+
+        collector = get_collector()
+        live = collector.candles.snapshot(asset, interval) if collector else None
+
+        def _load():
+            from pmanalysis.candles import list_window_candles
+
+            with get_session() as session:
+                return list_window_candles(
+                    session, asset, interval, limit=limit, live=live
+                )
+
+        return await run_db(_load)
+
     @app.get("/api/previews/{asset}/{interval}")
     async def api_recent_previews(
         asset: str,
@@ -275,43 +352,24 @@ def create_app() -> FastAPI:
 
         return await run_db(_load)
 
+    @app.get("/api/stats")
+    async def api_stats_all():
+        def _load():
+            with get_session() as session:
+                return {"items": stats_win_rates(session)}
+
+        return await run_db(_load)
+
     @app.get("/api/stats/{asset}/{interval}")
     async def api_stats(asset: str, interval: str):
         def _load():
             with get_session() as session:
-                return stats_win_rate(session, asset, interval)
+                return stats_for_market(session, asset, interval)
 
-        rate = await run_db(_load)
-        return {"win_rate_up_pct": rate}
-
-    @app.post("/api/admin/clear-db")
-    async def api_clear_db(request: Request):
-        """Delete all collected data (windows, ticks, archives). Keeps market seeds."""
-        try:
-            body = await request.json()
-        except Exception:
-            body = {}
-        if body.get("password") != ADMIN_PASSWORD:
-            raise HTTPException(401, "Incorrect password")
-        try:
-            result = await run_db(lambda: clear_database(include_archives=True))
-        except Exception as exc:
-            log.exception("clear-db failed")
-            raise HTTPException(500, f"Failed to clear database: {exc}") from exc
-
-        collector = get_collector()
-        if collector:
-            def _reload():
-                with get_session() as session:
-                    collector.window_manager._active_ids.clear()
-                    collector.window_manager.load_active_from_db(session)
-                    collector._refresh_token_map(session)
-
-            await run_db(_reload)
-            await collector.live_store.set_snapshot([], {})
-
-        await hydrate_live_store_from_db()
-        return {"ok": True, **result}
+        row = await run_db(_load)
+        if row is None:
+            raise HTTPException(400, "Invalid asset or interval")
+        return row
 
     @app.get("/api/export/{window_id}")
     async def api_export(window_id: int, format: str = "csv"):
@@ -334,9 +392,34 @@ def create_app() -> FastAPI:
     return app
 
 
+def _assert_port_free(host: str, port: int) -> None:
+    """Fail before uvicorn boots the collector. On Windows the server lifespan
+    runs before the socket bind, so a taken port otherwise starts feeds and
+    then dies with WinError 10048.
+    """
+    import socket
+
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.bind((host, port))
+    except OSError as exc:
+        in_use = getattr(exc, "winerror", None) in (10048, 10013) or exc.errno in (98, 48, 13)
+        if not in_use:
+            raise
+        log.error(
+            "Port %s is already in use. Stop the other pmanalysis process, then run this again. "
+            "Or choose a free port with PM_PORT.",
+            port,
+        )
+        raise SystemExit(1) from exc
+    finally:
+        probe.close()
+
+
 def run_web(*, embed_collector: bool = False) -> None:
     import uvicorn
 
+    _assert_port_free(WEB_HOST, WEB_PORT)
     if embed_collector:
         os.environ["PM_EMBED_COLLECTOR"] = "1"
     uvicorn.run(

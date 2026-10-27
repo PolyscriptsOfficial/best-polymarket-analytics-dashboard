@@ -221,6 +221,11 @@ class ChainlinkFeed:
     def connected(self) -> bool:
         return self._connected
 
+    def last_event_age_sec(self) -> float | None:
+        if not self._last_data_ts:
+            return None
+        return time.time() - self._last_data_ts
+
     def history(self, asset: str, max_points: int = 300) -> list[tuple[int, float]]:
         return self._history.get(asset, [])[-max_points:]
 
