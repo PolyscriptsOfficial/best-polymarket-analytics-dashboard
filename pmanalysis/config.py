@@ -11,6 +11,7 @@ DATA_DIR = ROOT_DIR / "data"
 DB_PATH = DATA_DIR / "pmanalysis.db"
 ARCHIVE_DIR = DATA_DIR / "archive"
 EXPORT_DIR = DATA_DIR / "exports"
+DATASET_DIR = EXPORT_DIR / "datasets"
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_API = "https://clob.polymarket.com"
@@ -31,6 +32,10 @@ MARKET_SLUGS: list[tuple[str, str, str]] = [
 DISCOVERY_LOOKAHEAD_MINUTES = 70
 STRIKE_POLL_INTERVAL_SEC = 3
 WINDOW_ROLL_GRACE_SEC = 15
+# Prefetch the next Gamma market and overlap-subscribe its CLOB tokens
+# this many seconds before the current window ends.
+ROLL_PREFETCH_SEC = int(os.getenv("PM_ROLL_PREFETCH_SEC", "30"))
+ROLL_WATCH_INTERVAL_SEC = float(os.getenv("PM_ROLL_WATCH_SEC", "1"))
 # How long finalize_expired retries Gamma for a winner before falling back to
 # comparing final oracle price vs strike. Gamma often hasn't published
 # outcomePrices > 0.9 within the old 15s grace period, which froze `outcome`
@@ -54,25 +59,39 @@ WS_DRAIN_TIMEOUT_SEC = float(os.getenv("PM_WS_DRAIN_SEC", "0.008"))
 DISCOVERY_INTERVAL_SEC = 30
 OPENING_CAPTURE_DEBOUNCE_SEC = 0.5
 
-# SQLite retention: once a window is archived to parquet (export_window_parquet),
-# its ticks/indicators are safe to drop from the live DB after this many hours.
-# Full-resolution history still lives forever in data/archive/*.parquet and the
-# backtest tools fall back to it automatically (see backtest/reversal_count.py).
-TICK_RETENTION_HOURS = int(os.getenv("PM_TICK_RETENTION_HOURS", "72"))
+# SQLite is the hot store only. After a window is archived to parquet, drop its
+# ticks/indicators from SQLite once they are older than this. The windows
+# catalog (slug, strike, outcome) is kept. Charts/backtests for older windows
+# read data/archive/*.parquet.
+TICK_RETENTION_HOURS = int(os.getenv("PM_TICK_RETENTION_HOURS", "24"))
 RETENTION_SWEEP_INTERVAL_SEC = int(os.getenv("PM_RETENTION_SWEEP_SEC", "1800"))
 
-# Persist every Binance / Chainlink / CLOB WS update (batched)
-# Default off — full feed recording balloons SQLite and can stall the live UI.
-FEED_RECORD_ENABLED = os.getenv("PM_FEED_RECORD", "0") != "0"
+# Optional raw WebSocket tape for History Binance/Oracle/CLOB tabs.
+# Default off: live UI and 1s parquet do not need it, and it unbounded-grows SQLite.
+# Set PM_FEED_RECORD=1 only for short debug captures.
+FEED_RECORD_ENABLED = os.getenv("PM_FEED_RECORD", "0").strip() == "1"
 FEED_RECORD_FLUSH_SEC = float(os.getenv("PM_FEED_FLUSH_SEC", "0.5"))
 FEED_RECORD_BATCH_SIZE = int(os.getenv("PM_FEED_BATCH_SIZE", "200"))
+
+# Feed-lag thresholds for CollectorGap + /status. A source is "stale" when its
+# last event is older than this, or "down" when the socket is disconnected.
+FEED_HEALTH_INTERVAL_SEC = float(os.getenv("PM_FEED_HEALTH_SEC", "2.0"))
+FEED_LAG_SEC = {
+    "binance": float(os.getenv("PM_BINANCE_LAG_SEC", "15")),
+    "chainlink": float(os.getenv("PM_CHAINLINK_LAG_SEC", "45")),
+    "clob": float(os.getenv("PM_CLOB_LAG_SEC", str(CLOB_STALE_SEC))),
+}
 
 # 0.0.0.0 = listen on all interfaces (VPS / remote access). Override: PM_HOST=127.0.0.1
 WEB_HOST = os.getenv("PM_HOST", "0.0.0.0")
 WEB_PORT = int(os.getenv("PM_PORT", "8000"))
 
-# Required to confirm destructive admin actions (e.g. Clear Database) from the UI.
-ADMIN_PASSWORD = os.getenv("PM_ADMIN_PASSWORD", "qweQWE123!@#")
+DATASET_TTL_DAYS = int(os.getenv("PM_DATASET_TTL_DAYS", "7"))
+DATASET_MAX_RANGE_DAYS = int(os.getenv("PM_DATASET_MAX_RANGE_DAYS", "366"))
+# Parallel parquet reads inside one dataset build (each archive file is one window).
+DATASET_READ_WORKERS = max(1, int(os.getenv("PM_DATASET_READ_WORKERS", "8")))
+# Dataset zip builds themselves; 1 keeps SQLite + disk sequential.
+DATASET_BUILD_WORKERS = max(1, int(os.getenv("PM_DATASET_BUILD_WORKERS", "1")))
 
 # Chainlink TWAP lookback via Polymarket RTDS (30 or 60). See:
 # https://docs.polymarket.com/market-data/chainlink-twap
@@ -102,3 +121,4 @@ def ensure_data_dirs() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
     EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+    DATASET_DIR.mkdir(parents=True, exist_ok=True)
