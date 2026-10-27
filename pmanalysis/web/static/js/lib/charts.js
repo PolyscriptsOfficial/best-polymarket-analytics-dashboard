@@ -32,8 +32,8 @@ PM.DualCharts = class {
       fixLeftEdge: false,
       fixRightEdge: false,
       barSpacing: 0.5,
-      minBarSpacing: 0.15,
-      maxBarSpacing: 12,
+      minBarSpacing: 0.02,
+      maxBarSpacing: 40,
       tickMarkFormatter: (time) => this._fmtTickLabel(time),
     };
 
@@ -97,8 +97,8 @@ PM.DualCharts = class {
       crosshairMarkerRadius: 4,
     };
 
-    const chainlinkColor = "#e8b923";
-    const binanceColor = "#3b82f6";
+    const chainlinkColor = "#3b82f6";
+    const binanceColor = "#e8b923";
     const twapColor = "#38bdf8";
     const yesColor = "#22c55e";
     const noColor = "#ef4444";
@@ -114,14 +114,14 @@ PM.DualCharts = class {
       color: chainlinkColor,
       crosshairMarkerBorderColor: chainlinkColor,
       crosshairMarkerBackgroundColor: chainlinkColor,
-      title: "Chainlink",
+      title: "",
     });
     this.binanceSeries = this.oracleChart.addLineSeries({
       ...curvedLine,
       color: binanceColor,
       crosshairMarkerBorderColor: binanceColor,
       crosshairMarkerBackgroundColor: binanceColor,
-      title: "Binance",
+      title: "",
     });
     this.twapSeries = this.oracleChart.addLineSeries({
       ...curvedLine,
@@ -129,7 +129,7 @@ PM.DualCharts = class {
       color: twapColor,
       crosshairMarkerBorderColor: twapColor,
       crosshairMarkerBackgroundColor: twapColor,
-      title: "TWAP 60s",
+      title: "",
     });
     this._twapLabel = "TWAP 60s";
     this.yesSeries = this.probChart.addLineSeries({
@@ -157,17 +157,29 @@ PM.DualCharts = class {
     this._openingBinance = null;
     this._openingProb = null;
     this._lastChartTime = -1; // -1 = no bars yet (0 is a valid 0:00 slot)
-    // Fine time slots so each websocket tick plots at its real elapsed time.
-    // Gaps are forward-filled so LWC logical spacing stays linear with wall time.
-    this._bucketMs = 100; // 100ms resolution
-    this._timeScale = 10; // slots per second (1000 / bucketMs)
+    this._windowHistory = false;
+    // 200ms slots keep the live line smooth. Gaps are forward-filled so the
+    // time axis stays linear; the paint timer advances one slot at a time.
+    this._bucketMs = 200;
+    this._timeScale = 5; // slots per second
     this._tickLabelSec = 10;
+    this._livePaintTimer = 0;
+    this._paintRaf = 0;
+    this._paintWait = 0;
+    this._lastPaintAt = 0;
+    this._pendingIncludeProb = false;
+    this._pendingTs = null;
+    this._endLabelW = 0;
+    this._endLabelH = 16;
     this._carry = { oracle: null, binance: null, twap: null, yes: null, no: null };
     this._hasStart = { oracle: false, binance: false, twap: false, yes: false, no: false };
     this._twapInitial = null;
     this._syncingRange = false;
     this._windowJustChanged = false;
     this._lockedView = null;
+    this._userAdjustedView = false;
+    this._armUserView = false;
+    this._fitTicket = 0;
     this._restorePending = 0;
     this._priceScaleManual = { oracle: false, prob: false };
     this._livePaintLoopActive = false;
@@ -176,12 +188,13 @@ PM.DualCharts = class {
     this._resizeObserver.observe(oracleEl);
     this._resizeObserver.observe(probEl);
 
+    this._endLabels = this._createEndLabels(oracleEl);
     this._oracleTooltip = this._createTooltip(oracleEl);
     this._probTooltip = this._createTooltip(probEl);
     this._syncingCrosshair = false;
     this._oracleTooltipEntries = [
       { series: this.oracleSeries, label: "Chainlink", color: chainlinkColor, format: (v) => PM.fmtUsdPrecise(v) },
-      { series: this.binanceSeries, label: "Binance", color: binanceColor, format: (v) => PM.fmtUsdPrecise(v) },
+      { series: this.binanceSeries, label: "Binance spot", color: binanceColor, format: (v) => PM.fmtUsdPrecise(v) },
       { series: this.twapSeries, label: "TWAP 60s", color: twapColor, format: (v) => PM.fmtUsdPrecise(v) },
     ];
     this._twapTooltipEntry = this._oracleTooltipEntries[2];
@@ -226,14 +239,12 @@ PM.DualCharts = class {
           scaleMargins: { top: 0.02, bottom: 0.02 },
         },
       });
-      this.oracleSeries.applyOptions({ title: compact ? "" : "Chainlink" });
-      this.binanceSeries.applyOptions({
-        title: compact ? "" : "Binance",
-        lastValueVisible: !compact,
-      });
-      this.twapSeries.applyOptions({ title: compact ? "" : this._twapLabel });
+      this.oracleSeries.applyOptions({ title: "" });
+      this.binanceSeries.applyOptions({ title: "", lastValueVisible: true });
+      this.twapSeries.applyOptions({ title: "" });
       this.yesSeries.applyOptions({ title: compact ? "" : "YES ask" });
       this.noSeries.applyOptions({ title: compact ? "" : "NO ask" });
+      this._syncEndLabels();
       if (this._strikeLine) {
         this._strikeLine.applyOptions({ title: compact ? "" : "TWAP Target" });
       }
@@ -292,6 +303,11 @@ PM.DualCharts = class {
 
   hasLiveData() {
     return this._lastChartTime >= 0;
+  }
+
+  /** True after this window's tick history was painted (not just a 0:00 seed). */
+  hasWindowHistory() {
+    return this._windowHistory;
   }
 
   _cloneLogicalRange(range) {
@@ -354,6 +370,7 @@ PM.DualCharts = class {
         /* ignore */
       }
       this._syncingRange = false;
+      this._syncEndLabels();
     };
     requestAnimationFrame(() => requestAnimationFrame(restore));
   }
@@ -377,7 +394,8 @@ PM.DualCharts = class {
     const sync = (source, target) => {
       source.timeScale().subscribeVisibleLogicalRangeChange((range) => {
         if (!range || this._syncingRange) return;
-        this._rememberViewFromChart(source);
+        if (this._armUserView) this._userAdjustedView = true;
+        if (this._userAdjustedView) this._rememberViewFromChart(source);
         this._syncingRange = true;
         try {
           const spacing = source.timeScale().options().barSpacing;
@@ -389,6 +407,7 @@ PM.DualCharts = class {
           /* ignore */
         }
         this._syncingRange = false;
+        this._syncEndLabels();
       });
     };
     sync(this.oracleChart, this.probChart);
@@ -396,10 +415,38 @@ PM.DualCharts = class {
   }
 
   _bindUserViewTracking() {
+    const arm = (el) => {
+      el.addEventListener("wheel", () => {
+        this._userAdjustedView = true;
+      }, { capture: true, passive: true });
+      el.addEventListener("pointerdown", () => {
+        this._armUserView = true;
+      }, { capture: true });
+      el.addEventListener("pointerup", () => {
+        this._armUserView = false;
+      });
+      el.addEventListener("pointercancel", () => {
+        this._armUserView = false;
+      });
+      el.addEventListener("dblclick", (event) => {
+        const rect = el.getBoundingClientRect();
+        if (event.clientX > rect.right - 64) return;
+        this._userAdjustedView = false;
+        this._armUserView = false;
+        this._lockedView = null;
+        this._fitFullWindow();
+      });
+    };
+    arm(this._oracleEl);
+    arm(this._probEl);
+
     const track = (chart) => {
       chart.timeScale().subscribeVisibleLogicalRangeChange((range) => {
         if (this._syncingRange || !range) return;
+        if (this._armUserView) this._userAdjustedView = true;
+        if (!this._userAdjustedView) return;
         this._rememberViewFromChart(chart);
+        if (chart === this.oracleChart) this._syncEndLabels();
       });
     };
     track(this.oracleChart);
@@ -413,6 +460,72 @@ PM.DualCharts = class {
     tip.hidden = true;
     panel.appendChild(tip);
     return tip;
+  }
+
+  _createEndLabels(chartEl) {
+    const el = document.createElement("div");
+    el.className = "chart-end-label";
+    el.style.setProperty("--end-label-color", "#3b82f6");
+    el.hidden = true;
+    chartEl.appendChild(el);
+    return { oracle: el };
+  }
+
+  _syncEndLabels() {
+    const el = this._endLabels?.oracle;
+    if (!el || !this._oracleEl) return;
+
+    const price = this._carry.oracle;
+    const dist = PM.distFromOpening(price, this._twapInitial);
+    const chartTime = this._lastChartTime;
+    const hostW = this._oracleEl.clientWidth || 0;
+    const hostH = this._oracleEl.clientHeight || 0;
+    if (dist == null || price == null || chartTime == null || chartTime < 0) {
+      el.hidden = true;
+      return;
+    }
+
+    let x = null;
+    let y = null;
+    try {
+      x = this.oracleChart.timeScale().timeToCoordinate(chartTime);
+      y = this.oracleSeries.priceToCoordinate(price);
+    } catch (_) {
+      el.hidden = true;
+      return;
+    }
+    if (x == null || y == null || y < 0 || y > hostH) {
+      el.hidden = true;
+      return;
+    }
+
+    const delta = PM.fmtPriceDelta(dist);
+    const html =
+      `<span class="chart-end-price">${PM.fmtUsdPrecise(price)}</span>` +
+      `<span class="chart-end-dist ${delta.cls}">${delta.text}</span>`;
+    if (el.dataset.html !== html) {
+      el.innerHTML = html;
+      el.dataset.html = html;
+      el.hidden = false;
+      this._endLabelW = el.offsetWidth || 0;
+      this._endLabelH = el.offsetHeight || 16;
+    }
+    el.hidden = false;
+
+    let axisW = 58;
+    try {
+      axisW = this.oracleChart.priceScale("right").width() || axisW;
+    } catch (_) {
+      /* scale may not be ready */
+    }
+    const maxX = Math.max(0, hostW - axisW - 6);
+    const w = this._endLabelW || 0;
+    const h = this._endLabelH || 16;
+    let left = x - w - 8;
+    if (left < 4) left = Math.min(x + 8, maxX - w);
+    left = Math.max(4, Math.min(left, maxX - w));
+    const top = Math.max(2, Math.min(y - h / 2, hostH - h - 2));
+    el.style.transform = `translate(${Math.round(left)}px, ${Math.round(top)}px)`;
   }
 
   _renderTooltip(chartEl, tooltipEl, seriesEntries, param) {
@@ -565,6 +678,11 @@ PM.DualCharts = class {
         height: this._probEl.clientHeight,
       });
     }
+    this._syncEndLabels();
+    if (!this._userAdjustedView) {
+      this._fitFullWindow();
+      return;
+    }
     if (view?.logicalRange || view?.range) {
       this._syncingRange = true;
       try {
@@ -594,7 +712,7 @@ PM.DualCharts = class {
   _barSpacingForWindow() {
     const width = this._oracleEl?.clientWidth || 800;
     const duration = Math.max(1, this._chartEndTime() - this._chartStartTime());
-    return Math.max(0.15, Math.min(6, (width - 48) / duration));
+    return Math.max(0.02, Math.min(40, (width - 56) / duration));
   }
 
   /** Map wall-clock ms → fine elapsed slots from window open (follows WS timestamps). */
@@ -608,28 +726,44 @@ PM.DualCharts = class {
     return Math.min(Math.max(0, slot), maxSlot);
   }
 
-  /** Keep the full market window on screen with evenly spaced time. */
+  /** Show 0:00 through the end of the window. A zoom the user made is left alone. */
   _fitFullWindow() {
-    if (!this._startTs || !this._endTs) return;
-    const from = this._chartStartTime();
-    const to = this._chartEndTime();
-    const view = {
-      range: { from, to },
-      logicalRange: null,
-      barSpacing: this._barSpacingForWindow(),
+    if (!this._startTs || !this._endTs || this._userAdjustedView) return;
+    const end = this._chartEndTime();
+    const spacing = this._barSpacingForWindow();
+    const ticket = ++this._fitTicket;
+    const apply = () => {
+      if (ticket !== this._fitTicket || this._userAdjustedView) return;
+      this._syncingRange = true;
+      try {
+        const opts = {
+          barSpacing: spacing,
+          minBarSpacing: 0.02,
+          rightOffset: 0,
+          shiftVisibleRangeOnNewBar: false,
+        };
+        this.oracleChart.timeScale().applyOptions(opts);
+        this.probChart.timeScale().applyOptions(opts);
+        const logical = { from: 0, to: end };
+        this.oracleChart.timeScale().setVisibleLogicalRange(logical);
+        this.probChart.timeScale().setVisibleLogicalRange(logical);
+      } catch (_) {
+        /* ignore until the series has points */
+      }
+      this._syncingRange = false;
+      this._syncEndLabels();
     };
-    this._rememberView(view);
-    this._syncingRange = true;
-    try {
-      this._applyTimeScaleView(view);
-    } catch (_) {
-      /* ignore */
-    }
-    this._syncingRange = false;
+    apply();
+    requestAnimationFrame(() => requestAnimationFrame(apply));
   }
 
   _liveChartTime(tsMs) {
     return this._toChartTime(tsMs ?? Date.now());
+  }
+
+  _shouldPaintLive() {
+    if (!this._startTs || !this._endTs) return false;
+    return Date.now() / 1000 < this._endTs + 1.5;
   }
 
   _stopLivePaintLoop() {
@@ -638,14 +772,23 @@ PM.DualCharts = class {
       cancelAnimationFrame(this._livePaintLoopRaf);
       this._livePaintLoopRaf = 0;
     }
+    if (this._livePaintTimer) {
+      clearInterval(this._livePaintTimer);
+      this._livePaintTimer = 0;
+    }
+  }
+
+  _syncLivePaintLoop() {
+    if (this._shouldPaintLive()) this._startLivePaintLoop();
+    else this._stopLivePaintLoop();
   }
 
   _startLivePaintLoop() {
-    if (this._livePaintLoopActive || !this._startTs) return;
+    if (this._livePaintTimer || !this._startTs || !this._shouldPaintLive()) return;
     this._livePaintLoopActive = true;
-    const loop = () => {
+    this._livePaintTimer = setInterval(() => {
       if (!this._livePaintLoopActive || !this._startTs) {
-        this._livePaintLoopRaf = 0;
+        this._stopLivePaintLoop();
         return;
       }
       const hasOracle =
@@ -653,12 +796,9 @@ PM.DualCharts = class {
         this._carry.binance != null ||
         this._carry.twap != null;
       const hasProb = this._carry.yes != null && this._carry.no != null;
-      if (hasOracle || hasProb) {
-        this._flushLivePaint(true);
-      }
-      this._livePaintLoopRaf = requestAnimationFrame(loop);
-    };
-    this._livePaintLoopRaf = requestAnimationFrame(loop);
+      if (hasOracle || hasProb) this._flushLivePaint(true);
+      if (!this._shouldPaintLive()) this._stopLivePaintLoop();
+    }, this._bucketMs);
   }
 
   _capLastChartTimeToNow() {
@@ -696,23 +836,58 @@ PM.DualCharts = class {
 
     this._seedStartFromCarry();
 
-    // Forward-fill skipped slots so the axis stays linear with wall time.
+    // Forward-fill missed 200ms slots so spacing stays linear. Cap each flush
+    // so a background tab does not apply thousands of updates in one frame.
+    // A 0:00 seed after switching 5m ↔ 15m is not history — do not stretch
+    // the current price across the elapsed window (flat line, empty YES/NO).
+    const MAX_CATCHUP = 50;
+    const stubSeed =
+      !this._windowHistory &&
+      this._lastChartTime <= this._chartStartTime() &&
+      chartTime - this._lastChartTime > this._timeScale * 2;
+    if (stubSeed) {
+      this._syncEndLabels();
+      return;
+    }
     if (this._lastChartTime >= 0 && chartTime > this._lastChartTime + 1) {
-      for (let t = this._lastChartTime + 1; t < chartTime; t++) {
+      const stepEnd = Math.min(chartTime, this._lastChartTime + MAX_CATCHUP);
+      for (let t = this._lastChartTime + 1; t < stepEnd; t++) {
         this._paintSeriesAt(t, includeProb);
       }
+      chartTime = stepEnd;
     }
 
     this._paintSeriesAt(chartTime, includeProb);
     if (this._lastChartTime < 0 || chartTime >= this._lastChartTime) {
       this._lastChartTime = chartTime;
     }
+    this._syncEndLabels();
   }
 
   _requestLiveUpdate(includeProb = true, tsMs = null) {
-    // Paint immediately at the websocket timestamp, then RAF keeps time advancing.
-    this._flushLivePaint(includeProb, tsMs);
-    this._startLivePaintLoop();
+    this._pendingIncludeProb = this._pendingIncludeProb || includeProb;
+    if (tsMs != null) this._pendingTs = tsMs;
+    if (this._paintRaf || this._paintWait) return;
+    const run = () => {
+      this._paintWait = 0;
+      this._paintRaf = 0;
+      this._lastPaintAt = performance.now();
+      const include = this._pendingIncludeProb;
+      const ts = this._pendingTs;
+      this._pendingIncludeProb = false;
+      this._pendingTs = null;
+      this._flushLivePaint(include, ts);
+      this._syncLivePaintLoop();
+    };
+    const wait = Math.max(0, this._bucketMs - (performance.now() - this._lastPaintAt));
+    if (wait <= 16) {
+      this._paintRaf = requestAnimationFrame(run);
+      return;
+    }
+    this._paintWait = setTimeout(() => {
+      this._paintWait = 0;
+      this._paintRaf = requestAnimationFrame(run);
+    }, wait);
   }
 
   updateFeedPrices({ ts_ms, oracle_price, binance_price, twap_oracle } = {}) {
@@ -784,21 +959,27 @@ PM.DualCharts = class {
   setTwapLabel(label) {
     if (!label || label === this._twapLabel) return;
     this._twapLabel = label;
-    try {
-      this.twapSeries.applyOptions({ title: this._isCompact() ? "" : label });
-    } catch (_) {
-      /* ignore */
-    }
     if (this._twapTooltipEntry) this._twapTooltipEntry.label = label;
+    this._syncEndLabels();
   }
 
-  /** Set Initial Price / TWAP target — only from true window-open TWAP. */
+  /** Set or clear the window-open TWAP target so HUD and the chart stay in sync. */
   setTwapInitial(price) {
-    if (price == null || !(price > 0)) return;
-    if (this._twapInitial != null) return;
+    if (price == null || !(price > 0)) {
+      if (this._twapInitial != null) {
+        this._twapInitial = null;
+        this._hasStart.twap = false;
+        this._setStrike(null);
+        this._syncEndLabels();
+      }
+      return;
+    }
+    if (this._twapInitial === price && this._strikeLine) return;
     this._twapInitial = price;
     this._setStrike(price);
+    this._hasStart.twap = false;
     this._ensureStartUpdate(this.twapSeries, "twap", price);
+    this._syncEndLabels();
   }
 
   /** Snap to fixed buckets aligned to window start. */
@@ -811,14 +992,16 @@ PM.DualCharts = class {
     return `${m}:${String(s).padStart(2, "0")}`;
   }
 
-  /** X-axis labels every 10 seconds (0:00, 0:10, 0:20, …). */
+  /** X-axis labels in elapsed window time (0:00, 0:30, 1:00, …). */
   _fmtTickLabel(chartTime) {
-    if (!this._startTs) return null;
-    // Only label whole-second boundaries that land on the 10s cadence.
-    if (chartTime % this._timeScale !== 0) return null;
-    const elapsed = Math.round(this._elapsedSec(chartTime));
-    if (elapsed % this._tickLabelSec !== 0) return null;
-    return this._fmtElapsed(chartTime);
+    if (!this._startTs) return "";
+    const elapsed = this._elapsedSec(chartTime);
+    const sec = Math.round(elapsed);
+    if (Math.abs(elapsed - sec) > 0.05) return "";
+    const windowSec = Math.max(1, (this._endTs || 0) - (this._startTs || 0));
+    const step = windowSec > 300 ? 60 : 30;
+    if (sec % step !== 0) return "";
+    return this._fmtElapsed(sec * this._timeScale);
   }
 
   _isValidPoint(p) {
@@ -843,7 +1026,9 @@ PM.DualCharts = class {
     this.noSeries.setData([]);
     this._setCurrentLine(null);
     this._lastChartTime = -1;
+    this._windowHistory = false;
     this._resetCarry();
+    this._syncEndLabels();
   }
 
   setWindowBounds(
@@ -857,18 +1042,29 @@ PM.DualCharts = class {
     const windowChanged = this._startTs !== startTs || this._endTs !== endTs;
     this._startTs = startTs || 0;
     this._endTs = endTs || 0;
-    if (openingPrice != null) this._openingPrice = openingPrice;
-    if (openingBinance != null) this._openingBinance = openingBinance;
-    if (openingProb != null) this._openingProb = openingProb;
-    if (twapInitial != null) this._twapInitial = twapInitial;
     if (windowChanged) {
       this._clearSeries();
+      this._openingPrice = openingPrice ?? null;
+      this._openingBinance = openingBinance ?? null;
+      this._openingProb = openingProb ?? null;
+      this._twapInitial = twapInitial ?? null;
+      this._setStrike(this._twapInitial);
       this._windowJustChanged = true;
       this._lockedView = null;
+      this._userAdjustedView = false;
+      this._armUserView = false;
       this._restorePending++;
       this._stopLivePaintLoop();
       this._resetPriceScales();
-      if (twapInitial != null) this._twapInitial = twapInitial;
+    } else {
+      if (openingPrice != null) this._openingPrice = openingPrice;
+      if (openingBinance != null) this._openingBinance = openingBinance;
+      if (openingProb != null) this._openingProb = openingProb;
+      if (twapInitial != null && twapInitial !== this._twapInitial) {
+        this._twapInitial = twapInitial;
+        this._hasStart.twap = false;
+        this._setStrike(twapInitial);
+      }
     }
     this._applyTimeScaleLayout();
   }
@@ -884,15 +1080,15 @@ PM.DualCharts = class {
       rightOffset: 0,
       secondsVisible: true,
       barSpacing: this._barSpacingForWindow(),
-      minBarSpacing: 0.15,
-      maxBarSpacing: 12,
+      minBarSpacing: 0.02,
+      maxBarSpacing: 40,
       tickMarkFormatter: (time) => this._fmtTickLabel(time),
     };
     const apply = () => {
       this.oracleChart.timeScale().applyOptions(scaleOpts);
       this.probChart.timeScale().applyOptions(scaleOpts);
     };
-    if (this._windowJustChanged) {
+    if (this._windowJustChanged || !this._userAdjustedView) {
       apply();
     } else {
       this._preserveVisibleRange(apply);
@@ -1040,7 +1236,6 @@ PM.DualCharts = class {
     if (twap.length) {
       this._carry.twap = twap[twap.length - 1].value;
       this._hasStart.twap = twap[0].time === chartStart;
-      if (this._twapInitial == null) this._twapInitial = twap[0].value;
     }
     if (yes.length) {
       this._carry.yes = yes[yes.length - 1].value;
@@ -1077,11 +1272,7 @@ PM.DualCharts = class {
       "binance",
       this._openingBinance ?? this._carry.binance
     );
-    this._ensureStartUpdate(
-      this.twapSeries,
-      "twap",
-      this._twapInitial ?? this._carry.twap
-    );
+    this._ensureStartUpdate(this.twapSeries, "twap", this._twapInitial);
     if (this._carry.yes != null && this._carry.no != null) {
       this._ensureStartUpdate(
         this.yesSeries,
@@ -1123,7 +1314,9 @@ PM.DualCharts = class {
     }
 
     if (!points || !points.length) {
+      const savedTwapInitial = twapInitial;
       this._clearSeries();
+      if (savedTwapInitial != null) this._twapInitial = savedTwapInitial;
       const oracleVal = this._openingPrice;
       const binanceVal = this._openingBinance;
       const yesVal = this._openingProb?.yes;
@@ -1156,13 +1349,12 @@ PM.DualCharts = class {
         this._lastChartTime = chartStart;
         this._capLastChartTimeToNow();
       }
-      this._setStrike(this._twapInitial ?? strikePrice ?? this._openingPrice);
+      this._setStrike(this._twapInitial);
       this._applyFixedProbScale();
-      if (this._windowJustChanged) {
-        this._windowJustChanged = false;
-        this._fitFullWindow();
-      }
-      this._startLivePaintLoop();
+      this._windowJustChanged = false;
+      this._userAdjustedView = false;
+      this._fitFullWindow();
+      this._syncLivePaintLoop();
       return;
     }
 
@@ -1173,9 +1365,6 @@ PM.DualCharts = class {
     if (oracle.length && this._openingPrice == null) {
       this._openingPrice = oracle[0].value;
     }
-    if (twap.length && this._twapInitial == null) {
-      this._twapInitial = twap[0].value;
-    }
     const applyData = () => {
       this.oracleSeries.setData(oracle);
       this.binanceSeries.setData(binance);
@@ -1183,13 +1372,13 @@ PM.DualCharts = class {
       this.yesSeries.setData(yes);
       this.noSeries.setData(no);
       // Target line tracks TWAP initial.
-      this._setStrike(this._twapInitial ?? strikePrice ?? this._openingPrice);
+      this._setStrike(this._twapInitial ?? strikePrice);
       if (oracle.length) {
         this._setCurrentLine(oracle[oracle.length - 1].value);
       }
     };
     const windowJustChanged = this._windowJustChanged;
-    if (windowJustChanged) {
+    if (windowJustChanged || !this._userAdjustedView) {
       this._windowJustChanged = false;
       applyData();
       this._fitFullWindow();
@@ -1208,9 +1397,11 @@ PM.DualCharts = class {
     if (lastTime >= 0 && (oracle.length || binance.length || twap.length || yes.length)) {
       this._lastChartTime = lastTime;
     }
+    this._windowHistory = !!(oracle.length || binance.length || twap.length || yes.length);
     this._capLastChartTimeToNow();
     this._applyFixedProbScale();
-    this._startLivePaintLoop();
+    this._syncLivePaintLoop();
+    this._syncEndLabels();
   }
 
   _setStrike(strike) {
@@ -1228,6 +1419,7 @@ PM.DualCharts = class {
         title: this._isCompact() ? "" : "TWAP Target",
       });
     }
+    this._syncEndLabels();
   }
 
   _setCurrentLine(price) {
@@ -1244,7 +1436,7 @@ PM.DualCharts = class {
     }
     this._currentLine = this.oracleSeries.createPriceLine({
       price,
-      color: "#e8b923",
+      color: "#3b82f6",
       lineWidth: 1,
       lineStyle: LightweightCharts.LineStyle.Dashed,
       axisLabelVisible: false,
@@ -1253,10 +1445,22 @@ PM.DualCharts = class {
   }
 
   destroy() {
+    if (this._paintWait) {
+      clearTimeout(this._paintWait);
+      this._paintWait = 0;
+    }
+    if (this._paintRaf) {
+      cancelAnimationFrame(this._paintRaf);
+      this._paintRaf = 0;
+    }
     this._stopLivePaintLoop();
     this._resizeObserver.disconnect();
     this._oracleTooltip?.remove();
     this._probTooltip?.remove();
+    if (this._endLabels) {
+      for (const el of Object.values(this._endLabels)) el.remove();
+      this._endLabels = null;
+    }
     this.oracleChart.remove();
     this.probChart.remove();
   }
@@ -1367,6 +1571,165 @@ PM.MiniPreviewChart = class {
   }
 
   destroy() {
+    this._chart.remove();
+  }
+};
+
+/** One bar per up/down window (5m or 15m). Unix time, colored by close vs open. */
+PM.CandleChart = class {
+  constructor(el) {
+    this._el = el;
+    this._meta = new Map();
+    this.onSelect = null;
+    this._chart = LightweightCharts.createChart(el, {
+      layout: {
+        background: { color: "#121a24" },
+        textColor: "#8b97a8",
+        fontFamily: "'IBM Plex Mono', ui-monospace, monospace",
+        fontSize: 11,
+        attributionLogo: false,
+      },
+      grid: {
+        vertLines: { color: "#1e2a3a" },
+        horzLines: { color: "#1e2a3a" },
+      },
+      rightPriceScale: { borderColor: "#1e2a3a", minimumWidth: 58 },
+      timeScale: {
+        borderColor: "#1e2a3a",
+        timeVisible: true,
+        secondsVisible: false,
+        rightOffset: 3,
+        barSpacing: 8,
+        minBarSpacing: 3,
+        tickMarkFormatter: (time) => PM.fmtEtClock(time),
+      },
+      crosshair: {
+        mode: LightweightCharts.CrosshairMode.Normal,
+        vertLine: {
+          width: 1,
+          color: "rgba(232, 238, 246, 0.22)",
+          style: LightweightCharts.LineStyle.Dashed,
+        },
+        horzLine: { visible: false, labelVisible: false },
+      },
+      localization: {
+        timeFormatter: (time) => PM.fmtEtStamp(time),
+        priceFormatter: (price) => {
+          if (price >= 1000) return price.toFixed(1);
+          if (price >= 100) return price.toFixed(2);
+          return price.toFixed(4);
+        },
+      },
+      handleScroll: {
+        mouseWheel: false,
+        pressedMouseMove: true,
+        horzTouchDrag: true,
+        vertTouchDrag: false,
+      },
+      handleScale: {
+        axisPressedMouseMove: { time: true, price: true },
+        axisDoubleClickReset: true,
+        mouseWheel: true,
+        pinch: true,
+      },
+    });
+    this._series = this._chart.addCandlestickSeries({
+      upColor: "#22c55e",
+      downColor: "#ef4444",
+      borderUpColor: "#22c55e",
+      borderDownColor: "#ef4444",
+      wickUpColor: "#22c55e",
+      wickDownColor: "#ef4444",
+      priceLineVisible: false,
+      lastValueVisible: true,
+    });
+    this._tooltip = document.createElement("div");
+    this._tooltip.className = "chart-tooltip";
+    this._tooltip.hidden = true;
+    el.style.position = el.style.position || "relative";
+    el.appendChild(this._tooltip);
+
+    this._chart.subscribeCrosshairMove((param) => this._onMove(param));
+    this._chart.subscribeClick((param) => {
+      if (!param?.time || typeof this.onSelect !== "function") return;
+      const meta = this._meta.get(param.time);
+      if (meta) this.onSelect(meta);
+    });
+    this._resizeObserver = new ResizeObserver(() => this.resize());
+    this._resizeObserver.observe(el);
+    this.resize();
+  }
+
+  setCandles(items) {
+    this._meta = new Map();
+    const bars = [];
+    for (const item of items || []) {
+      if (item.time == null || item.open == null || item.close == null) continue;
+      const bar = {
+        time: item.time,
+        open: item.open,
+        high: item.high ?? Math.max(item.open, item.close),
+        low: item.low ?? Math.min(item.open, item.close),
+        close: item.close,
+      };
+      bars.push(bar);
+      this._meta.set(item.time, item);
+    }
+    this._series.setData(bars);
+    if (bars.length) this._chart.timeScale().fitContent();
+    return bars.at(-1) || null;
+  }
+
+  updateLive(bar) {
+    if (!bar || bar.time == null) return;
+    this._series.update({
+      time: bar.time,
+      open: bar.open,
+      high: bar.high,
+      low: bar.low,
+      close: bar.close,
+    });
+    const prev = this._meta.get(bar.time) || {};
+    this._meta.set(bar.time, { ...prev, ...bar, live: true });
+  }
+
+  _onMove(param) {
+    if (!param?.point || param.time == null || !param.seriesData) {
+      this._tooltip.hidden = true;
+      return;
+    }
+    const data = param.seriesData.get(this._series);
+    if (!data) {
+      this._tooltip.hidden = true;
+      return;
+    }
+    const meta = this._meta.get(param.time) || {};
+    const side = data.close >= data.open ? "UP" : "DOWN";
+    const label = meta.outcome || side;
+    this._tooltip.innerHTML =
+      `<div class="chart-tooltip-time">${PM.fmtEtStamp(param.time)}</div>` +
+      `<div class="chart-tooltip-row"><span class="chart-tooltip-dot" style="background:${side === "UP" ? "#22c55e" : "#ef4444"}"></span>${label}<strong>${PM.fmtUsdPrecise(data.close)}</strong></div>` +
+      `<div class="chart-tooltip-row">O ${PM.fmtUsdPrecise(data.open)}</div>` +
+      `<div class="chart-tooltip-row">H ${PM.fmtUsdPrecise(data.high)}</div>` +
+      `<div class="chart-tooltip-row">L ${PM.fmtUsdPrecise(data.low)}</div>`;
+    this._tooltip.hidden = false;
+    const width = this._el.clientWidth || 0;
+    const left = Math.min(param.point.x + 12, Math.max(8, width - 180));
+    this._tooltip.style.left = `${left}px`;
+    this._tooltip.style.top = `${Math.max(8, param.point.y - 12)}px`;
+  }
+
+  resize() {
+    if (!this._el) return;
+    this._chart.applyOptions({
+      width: this._el.clientWidth || 0,
+      height: this._el.clientHeight || 230,
+    });
+  }
+
+  destroy() {
+    this._resizeObserver.disconnect();
+    this._tooltip?.remove();
     this._chart.remove();
   }
 };

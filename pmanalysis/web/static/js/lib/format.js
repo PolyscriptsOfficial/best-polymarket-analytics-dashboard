@@ -100,12 +100,14 @@ PM.openingProbFromPoints = (points, startTs) => {
   const startMs = startTs * 1000;
   let best = null;
   for (const p of points) {
-    if (!(p.yes_mid > 0 || p.no_mid > 0)) continue;
+    if (!(p.yes_ask > 0 || p.no_ask > 0 || p.yes_mid > 0 || p.no_mid > 0)) continue;
     if (p.ts_ms < startMs - 2000 || p.ts_ms > startMs + 120_000) continue;
     if (!best || p.ts_ms < best.ts_ms) best = p;
   }
   if (!best) return null;
-  return { yes: best.yes_mid * 100, no: best.no_mid * 100 };
+  const yes = best.yes_ask > 0 ? best.yes_ask : best.yes_mid * 100;
+  const no = best.no_ask > 0 ? best.no_ask : best.no_mid * 100;
+  return { yes, no };
 };
 
 PM.openingFromPoints = (points, startTs) => {
@@ -160,6 +162,17 @@ PM.windowBounds = (m, interval) => {
   return { start, end: start + sec };
 };
 
+PM.clockBounds = (interval) => {
+  const step = window.PM_CONFIG?.intervalSeconds?.[interval] || 300;
+  const start = Math.floor(Date.now() / 1000 / step) * step;
+  return { start, end: start + step };
+};
+
+PM.clockSlug = (asset, interval) => {
+  const { start } = PM.clockBounds(interval);
+  return `${String(asset || "").toLowerCase()}-updown-${interval}-${start}`;
+};
+
 PM.marketMap = (markets) => {
   const map = {};
   (markets || []).forEach((m) => {
@@ -168,7 +181,39 @@ PM.marketMap = (markets) => {
   return map;
 };
 
+/** Green/red follows current TWAP vs the target (initial TWAP). */
 PM.positionClass = (m) => {
-  if (!m || m.dist_from_strike == null) return "idle";
-  return m.dist_from_strike >= 0 ? "win" : "lose";
+  const dist = m?.dist_from_opening ?? m?.dist_from_strike;
+  if (dist == null || Number.isNaN(Number(dist))) return "idle";
+  return Number(dist) >= 0 ? "win" : "lose";
+};
+
+PM.fmtAsk = (ask, mid) => {
+  if (ask != null && Number(ask) > 0) return `${Number(ask).toFixed(1)}¢`;
+  return PM.fmtProb(mid);
+};
+
+const ET_CLOCK = new Intl.DateTimeFormat("en-US", {
+  timeZone: "America/New_York",
+  hour: "numeric",
+  minute: "2-digit",
+  hour12: true,
+});
+const ET_STAMP = new Intl.DateTimeFormat("en-US", {
+  timeZone: "America/New_York",
+  month: "short",
+  day: "numeric",
+  hour: "numeric",
+  minute: "2-digit",
+  hour12: true,
+});
+
+PM.fmtEtClock = (unixSec) => {
+  if (unixSec == null) return "";
+  return ET_CLOCK.format(new Date(unixSec * 1000)).replace(/\s/g, "");
+};
+
+PM.fmtEtStamp = (unixSec) => {
+  if (unixSec == null) return "";
+  return `${ET_STAMP.format(new Date(unixSec * 1000))} ET`;
 };

@@ -3,6 +3,9 @@
   let selected = { asset: preselect.asset, interval: preselect.interval };
   let marketByKey = {};
   let charts = null;
+  let candleChart = null;
+  let liveCandle = null;
+  let candleLoadToken = 0;
   let liveSlug = "";
   let selectedSlug = "";
   let slugWindows = [];
@@ -21,6 +24,7 @@
   let navRaf = 0;
   let metricsRaf = 0;
   let pendingMetricsMarket = null;
+  let noticeTimer = 0;
 
   let previewCharts = [];
   let previewLoadToken = 0;
@@ -28,6 +32,8 @@
   let previewPage = 0;
   let previewHasOlder = false;
   let previewHasNewer = false;
+  let rollSeq = 0;
+  let previewTimer = 0;
 
   const el = (id) => document.getElementById(id);
   const SLUG_CACHE_MS = 60000;
@@ -79,6 +85,7 @@
     requestAnimationFrame(() => {
       try {
         charts?.resize?.();
+        candleChart?.resize?.();
       } catch (_) {
         /* ignore */
       }
@@ -157,11 +164,78 @@
     if (metricsRaf) return;
     metricsRaf = requestAnimationFrame(() => {
       metricsRaf = 0;
-      if (pendingMetricsMarket) {
-        updateMetrics(pendingMetricsMarket);
-        pendingMetricsMarket = null;
-      }
+      const pending = pendingMetricsMarket;
+      pendingMetricsMarket = null;
+      if (pending) updateMetrics(pending);
     });
+  }
+
+  function isStaleClockMarket(m, interval = selected.interval) {
+    if (!m?.start_ts) return false;
+    const clock = PM.clockBounds(interval || m.interval);
+    return !!(clock && m.start_ts < clock.start);
+  }
+
+  function liveAssetPrices(prev) {
+    if (!prev) return {};
+    const out = {};
+    if (prev.oracle_price != null) out.oracle_price = prev.oracle_price;
+    if (prev.twap_oracle != null) out.twap_oracle = prev.twap_oracle;
+    return out;
+  }
+
+  function freshClockMarket(asset, interval, bounds, prev) {
+    const clock = bounds || PM.clockBounds(interval);
+    return {
+      asset,
+      interval,
+      slug: PM.clockSlug(asset, interval),
+      question: prev?.question || "",
+      start_ts: clock.start,
+      end_ts: clock.end,
+      yes_mid: 0,
+      no_mid: 0,
+      yes_ask: 0,
+      no_ask: 0,
+      combined_ask: 0,
+      strike_price: null,
+      opening_oracle_price: null,
+      twap_initial: null,
+      dist_from_opening: null,
+      dist_from_strike: null,
+      outcome: null,
+      secs_remaining: Math.max(0, clock.end - Math.floor(Date.now() / 1000)),
+      ...liveAssetPrices(prev),
+    };
+  }
+
+  function applyMarketCard(incoming) {
+    if (!incoming?.asset || !incoming?.interval) return null;
+    const key = `${incoming.asset}:${incoming.interval}`;
+    const clock = PM.clockBounds(incoming.interval);
+    const prev = marketByKey[key];
+    if (clock && incoming.start_ts && incoming.start_ts < clock.start) {
+      if (!prev?.start_ts || prev.start_ts < clock.start) {
+        marketByKey[key] = freshClockMarket(incoming.asset, incoming.interval, clock, incoming);
+      }
+      return marketByKey[key];
+    }
+    if (prev?.start_ts && incoming.start_ts && incoming.start_ts < prev.start_ts) {
+      return prev;
+    }
+    if (prev && incoming.start_ts === prev.start_ts) {
+      incoming = {
+        ...incoming,
+        twap_initial: incoming.twap_initial ?? prev.twap_initial ?? null,
+        opening_oracle_price: incoming.opening_oracle_price ?? prev.opening_oracle_price ?? null,
+      };
+    }
+    marketByKey[key] = incoming;
+    return incoming;
+  }
+
+  function hasLiveQuote(m) {
+    return !!(m && (m.yes_ask > 0 || m.no_ask > 0 || m.yes_mid > 0 || m.no_mid > 0));
   }
 
   function marketBounds(m, interval = selected.interval) {
@@ -169,31 +243,184 @@
     return PM.windowBounds(m, interval);
   }
 
-  function renderTicker() {
-    el("oracle-ticker").innerHTML = assets
-      .map((asset) => {
-        const price = lastOraclePrices[asset];
-        const m = marketByKey[`${asset}:5m`];
-        const opening = m?.twap_initial ?? null;
-        const currentTwap = m?.twap_oracle ?? null;
-        const current = price ?? m?.oracle_price ?? null;
-        // Difference = current TWAP − initial TWAP.
-        const diff = PM.distInitialMinusTwap(opening, currentTwap);
-        const delta = PM.fmtPriceDelta(diff);
-        const priceText = current != null ? PM.fmtUsd(current) : "—";
-        const diffHtml =
-          diff != null
-            ? `<span class="ticker-diff ${delta.cls}">${delta.text}</span>`
-            : "";
-        return (
-          `<div class="ticker-item">` +
-          `<img class="ticker-icon" src="/static/img/coins/${asset.toLowerCase()}.svg?v=term37" alt="${asset}" title="${asset}" width="16" height="16">` +
-          `<span class="ticker-price">${priceText}</span>` +
-          diffHtml +
-          `</div>`
-        );
+  function pointInLiveBounds(point, bounds) {
+    if (!bounds || point?.ts_ms == null) return false;
+    const t = point.ts_ms / 1000;
+    return t >= bounds.start && t < bounds.end + 1.5;
+  }
+
+  function resetLiveChart(bounds, market) {
+    const twapInitial = market?.twap_initial ?? null;
+    const openings = {
+      opening: spotOpeningForMarket(market, null),
+      openingBinance: null,
+      openingProb: null,
+      twapInitial,
+    };
+    applyBounds(bounds, true, openings);
+    if (charts) {
+      charts.setHistory(
+        [],
+        twapInitial,
+        bounds?.start,
+        bounds?.end,
+        openings.opening,
+        openings.openingBinance,
+        openings.openingProb,
+        twapInitial
+      );
+    }
+    if (bounds?.end) startCountdown(bounds.end);
+  }
+
+  function decorateLiveRoll(seq) {
+    pendingMetricsMarket = null;
+    slugRefreshAt = 0;
+    const select = el("slug-select");
+    if (select && selectedSlug) select.value = selectedSlug;
+    socket.select(selected.asset, selected.interval);
+    updatePolymarketLinks(liveSlug);
+    const m = marketByKey[`${selected.asset}:${selected.interval}`];
+    if (m) {
+      updateMetrics(m);
+      applyLiveCandle(m);
+      if (m.twap_initial == null || m.opening_oracle_price == null) scheduleOpeningPoll();
+      else stopOpeningPoll();
+    }
+    updateNavBadges();
+    renderTicker();
+    void refreshSlugDropdown(true);
+    void loadSlugHistory(liveSlug).catch(() => {});
+    void loadCandles();
+    if (previewTimer) clearTimeout(previewTimer);
+    previewTimer = setTimeout(() => {
+      previewTimer = 0;
+      if (seq !== rollSeq) return;
+      void loadRecentPreviews(true);
+    }, 300);
+  }
+
+  function snapToClockWindow(forceChartReset = false) {
+    if (!viewingLive) return false;
+    const bounds = PM.clockBounds(selected.interval);
+    if (!bounds) return false;
+
+    let marketsRolled = 0;
+    for (const asset of assets) {
+      const key = `${asset}:${selected.interval}`;
+      const prev = marketByKey[key];
+      if (prev?.start_ts === bounds.start && prev?.end_ts === bounds.end) continue;
+      marketByKey[key] = freshClockMarket(asset, selected.interval, bounds, prev);
+      marketsRolled += 1;
+    }
+
+    const chartNeedsReset =
+      forceChartReset ||
+      !(
+        activeBounds &&
+        activeBounds.start === bounds.start &&
+        activeBounds.end === bounds.end
+      );
+    if (!chartNeedsReset && !marketsRolled) return false;
+
+    const key = `${selected.asset}:${selected.interval}`;
+    const slug = marketByKey[key]?.slug || PM.clockSlug(selected.asset, selected.interval);
+    liveSlug = slug;
+    selectedSlug = slug;
+    pendingMetricsMarket = null;
+
+    if (chartNeedsReset) {
+      rollSeq += 1;
+      chartOpeningPrice = null;
+      resetLiveChart(bounds, marketByKey[key]);
+      decorateLiveRoll(rollSeq);
+    } else {
+      const m = marketByKey[key];
+      if (m) {
+        updateMetrics(m);
+        updateOracleHero(m);
+        applyLiveCandle(m);
+        if (m.twap_initial == null || m.opening_oracle_price == null) scheduleOpeningPoll();
+        else stopOpeningPoll();
+      }
+      updateNavBadges();
+      renderTicker();
+      const select = el("slug-select");
+      if (select && selectedSlug) select.value = selectedSlug;
+      updatePolymarketLinks(liveSlug);
+    }
+    return true;
+  }
+
+  function ensureTicker() {
+    const host = el("oracle-ticker");
+    if (!host || host.dataset.built === "1") return;
+    host.replaceChildren(
+      ...assets.map((asset) => {
+        const row = document.createElement("div");
+        row.className = "ticker-item";
+        row.dataset.asset = asset;
+        const icon = document.createElement("img");
+        icon.className = "ticker-icon";
+        icon.src = `/static/img/coins/${asset.toLowerCase()}.svg?v=term37`;
+        icon.alt = asset;
+        icon.width = 16;
+        icon.height = 16;
+        const price = document.createElement("span");
+        price.className = "ticker-price";
+        price.textContent = "—";
+        const diff = document.createElement("span");
+        diff.className = "ticker-diff";
+        row.append(icon, price, diff);
+        return row;
       })
-      .join("");
+    );
+    host.dataset.built = "1";
+  }
+
+  function renderTicker() {
+    const host = el("oracle-ticker");
+    if (!host) return;
+    ensureTicker();
+    for (const asset of assets) {
+      const row = host.querySelector(`[data-asset="${asset}"]`);
+      if (!row) continue;
+      const price = lastOraclePrices[asset];
+      const m = marketByKey[`${asset}:5m`];
+      const opening = m?.twap_initial ?? null;
+      const currentTwap = m?.twap_oracle ?? null;
+      const current = price ?? m?.oracle_price ?? null;
+      const diff = PM.distInitialMinusTwap(opening, currentTwap);
+      const delta = PM.fmtPriceDelta(diff);
+      const priceEl = row.querySelector(".ticker-price");
+      const diffEl = row.querySelector(".ticker-diff");
+      if (priceEl) priceEl.textContent = current != null ? PM.fmtUsd(current) : "—";
+      if (diffEl) {
+        diffEl.textContent = diff != null ? delta.text : "";
+        diffEl.className = `ticker-diff${delta.cls ? ` ${delta.cls}` : ""}`;
+      }
+    }
+  }
+
+  function showNotice(text) {
+    const node = el("form-notice");
+    if (!node) return;
+    clearTimeout(noticeTimer);
+    if (!text) {
+      node.hidden = true;
+      node.textContent = "";
+      return;
+    }
+    node.hidden = false;
+    node.textContent = text;
+    noticeTimer = setTimeout(() => {
+      node.hidden = true;
+    }, 4200);
+  }
+
+  function fmtQuotePair(m) {
+    if (!hasLiveQuote(m)) return "—";
+    return `${PM.fmtAsk(m.yes_ask, m.yes_mid)} / ${PM.fmtAsk(m.no_ask, m.no_mid)}`;
   }
 
   function currentViewSlug() {
@@ -232,7 +459,7 @@
     const slug = currentViewSlug();
     const url = PM.polymarketEventUrl(slug);
     if (!url) {
-      alert("No market slug to open yet");
+      showNotice("No market slug to open yet");
       return false;
     }
     updatePolymarketLinks(slug);
@@ -245,6 +472,8 @@
     if (title) {
       title.textContent = `${selected.asset} Price Chart`;
     }
+    const candles = el("candle-chart-title");
+    if (candles) candles.textContent = `${selected.interval} candles`;
   }
 
   function updateNavBadges() {
@@ -252,7 +481,7 @@
       const key = `${btn.dataset.asset}:${btn.dataset.interval}`;
       const m = marketByKey[key];
       const badge = btn.querySelector(".badge");
-      if (badge) badge.textContent = m?.slug ? PM.fmtProb(m.yes_mid) : "—";
+      if (badge) badge.textContent = hasLiveQuote(m) ? PM.fmtProb(m.yes_mid) : "—";
       btn.classList.remove("win", "lose", "idle");
       btn.classList.add(PM.positionClass(m));
       btn.classList.toggle(
@@ -278,7 +507,7 @@
               const cls = PM.positionClass(m);
               const active =
                 selected.asset === asset && selected.interval === interval ? "active" : "";
-              const badge = m?.slug ? PM.fmtProb(m.yes_mid) : "—";
+              const badge = hasLiveQuote(m) ? PM.fmtProb(m.yes_mid) : "—";
               return `<button class="nav-btn ${cls} ${active}" data-asset="${asset}" data-interval="${interval}">
                 <span>${interval}</span><span class="badge">${badge}</span>
               </button>`;
@@ -297,59 +526,59 @@
   }
 
   async function switchMarket(asset, interval) {
+    const switched = selected.asset !== asset || selected.interval !== interval;
     selected = { asset, interval };
     viewingLive = true;
-    selectedSlug = "";
     slugRefreshAt = 0;
-    activeBounds = null;
-    chartOpeningPrice = null;
+    if (switched) {
+      activeBounds = null;
+      chartOpeningPrice = null;
+    }
     updateLiveButton();
     updateTwapLabels();
 
-    const m = marketByKey[`${asset}:${interval}`];
     el("sel-title").textContent = `${asset} Up or Down · ${interval}`;
     updateChartTitle();
-    if (m?.slug) {
-      liveSlug = m.slug;
-      selectedSlug = liveSlug;
-      const bounds = PM.windowBounds(m, interval);
-      const openings = chartOpenings([], bounds?.start, m);
-      applyBounds(bounds, true, openings);
-      if (charts) {
-        charts.setHistory(
-          [],
-          openings.twapInitial ?? m.twap_initial ?? null,
-          bounds?.start,
-          bounds?.end,
-          openings.opening,
-          openings.openingBinance,
-          openings.openingProb,
-          openings.twapInitial ?? m.twap_initial ?? null
-        );
-      }
-      updateMetrics(m);
-      startCountdown(m.end_ts);
-    } else {
-      liveSlug = "";
-      clearCountdown();
-      applyBounds(null, true);
-      if (charts) charts.setHistory([], null, 0, 0, null);
-    }
-
-    updateNavBadges();
-    socket.select(asset, interval);
     if (isNarrow()) applySidebarCollapsed(true, false);
-    await refreshSlugDropdown(false);
-
-    if (viewingLive && liveSlug) {
-      try {
-        await loadSlugHistory(liveSlug);
-      } catch {
-        /* history arrives via WebSocket */
+    snapToClockWindow(switched);
+    socket.select(asset, interval);
+    const m = marketByKey[`${asset}:${interval}`];
+    if (!activeBounds) {
+      if (m?.slug) {
+        liveSlug = m.slug;
+        selectedSlug = liveSlug;
+        const bounds = PM.windowBounds(m, interval);
+        const openings = chartOpenings([], bounds?.start, m);
+        applyBounds(bounds, true, openings);
+        if (charts) {
+          charts.setHistory(
+            [],
+            openings.twapInitial ?? m.twap_initial ?? null,
+            bounds?.start,
+            bounds?.end,
+            openings.opening,
+            openings.openingBinance,
+            openings.openingProb,
+            openings.twapInitial ?? m.twap_initial ?? null
+          );
+        }
+        updateMetrics(m);
+        startCountdown(m.end_ts);
+      } else {
+        liveSlug = "";
+        clearCountdown();
+        applyBounds(null, true);
+        if (charts) charts.setHistory([], null, 0, 0, null);
       }
     }
+    updateNavBadges();
+    const history = viewingLive && liveSlug
+      ? loadSlugHistory(liveSlug).catch(() => {})
+      : Promise.resolve();
+    await Promise.all([refreshSlugDropdown(false), history]);
     updatePolymarketLinks();
     void loadRecentPreviews(true);
+    void loadCandles();
   }
 
   function boundsFromWindow(w) {
@@ -384,9 +613,7 @@
       openingProb: fromPoints.prob ?? null,
       // Chainlink TWAP at open seeds TWAP line + Initial Price.
       twapInitial:
-        twapInitialPrice(m, windowMeta) ??
-        fromPoints.twap ??
-        null,
+        twapInitialPrice(m, windowMeta) ?? fromPoints.twap ?? chartOpeningPrice ?? null,
     };
   }
 
@@ -451,68 +678,58 @@
         stopOpeningPoll();
         return;
       }
-      const m = marketByKey[`${selected.asset}:${selected.interval}`];
+      const key = `${selected.asset}:${selected.interval}`;
+      const m = marketByKey[key];
       if (!m?.slug) return;
-      if (m.opening_oracle_price != null) {
+      if (m.twap_initial != null && m.opening_oracle_price != null) {
         stopOpeningPoll();
         return;
       }
       try {
-        const res = await fetch(`/api/windows/${encodeURIComponent(m.slug)}/ticks`);
+        const res = await fetch("/api/markets");
         if (!res.ok) return;
-        const data = await res.json();
-        if (data.window?.opening_oracle_price != null) {
-          marketByKey[`${selected.asset}:${selected.interval}`] = {
-            ...m,
-            opening_oracle_price: data.window.opening_oracle_price,
-            strike_price: data.window.strike_price ?? m.strike_price,
-          };
-          updateOracleHero(marketByKey[`${selected.asset}:${selected.interval}`], data.window);
-          renderTicker();
-          stopOpeningPoll();
-        }
+        const markets = await res.json();
+        const fresh = (markets || []).find(
+          (row) => row.asset === selected.asset && row.interval === selected.interval
+        );
+        if (!fresh) return;
+        if (isStaleClockMarket(fresh, selected.interval)) return;
+        const adopted = applyMarketCard(fresh) || marketByKey[key];
+        updateMetrics(adopted);
+        renderTicker();
+        if (adopted?.twap_initial != null && adopted?.opening_oracle_price != null) stopOpeningPoll();
       } catch {
         /* retry */
       }
-    }, 2000);
+    }, 3000);
   }
 
-  async function handleWindowRoll(market) {
-    if (!market?.slug) return;
-    const bounds = PM.windowBounds(market, selected.interval);
-    activeBounds = null;
+  function handleWindowRoll(market) {
+    if (!viewingLive || !market?.slug) return;
+    const clock = PM.clockBounds(selected.interval);
+    if (clock && market.start_ts && market.start_ts < clock.start) return;
+    const bounds = marketBounds(market, selected.interval) || clock;
+    if (activeBounds && bounds && activeBounds.start === bounds.start) {
+      applyMarketCard(market);
+      liveSlug = market.slug;
+      selectedSlug = market.slug;
+      updateMetrics(market);
+      applyLiveCandle(market);
+      updateNavBadges();
+      renderTicker();
+      updatePolymarketLinks(market.slug);
+      if (market.end_ts) startCountdown(market.end_ts);
+      if (market.twap_initial == null || market.opening_oracle_price == null) scheduleOpeningPoll();
+      else stopOpeningPoll();
+      return;
+    }
+    rollSeq += 1;
+    liveSlug = market.slug;
+    selectedSlug = market.slug;
+    applyMarketCard(market);
     chartOpeningPrice = null;
-    const openings = chartOpenings([], bounds?.start, market);
-    applyBounds(bounds, true, openings);
-    if (charts) {
-      charts.setHistory(
-        [],
-        openings.twapInitial ?? market.twap_initial ?? null,
-        bounds?.start,
-        bounds?.end,
-        openings.opening,
-        openings.openingBinance,
-        openings.openingProb,
-        openings.twapInitial ?? market.twap_initial ?? null
-      );
-    }
-    updateOracleHero(market);
-    slugRefreshAt = 0;
-    await refreshSlugDropdown(true);
-    selectedSlug = liveSlug;
-    const select = el("slug-select");
-    if (select && selectedSlug) select.value = selectedSlug;
-    socket.select(selected.asset, selected.interval);
-    startCountdown(market.end_ts);
-    updateMetrics(market);
-    if (market.opening_oracle_price == null) scheduleOpeningPoll();
-    try {
-      await loadSlugHistory(liveSlug);
-    } catch {
-      /* onHistory will backfill from RAM */
-    }
-    updatePolymarketLinks();
-    void loadRecentPreviews(true);
+    resetLiveChart(bounds, market);
+    decorateLiveRoll(rollSeq);
   }
 
   async function refreshSlugDropdown(force = false) {
@@ -583,17 +800,17 @@
   }
 
   function twapInitialPrice(m, windowMeta) {
-    // Initial Price = Chainlink TWAP at window open (RTDS), not spot/Chainlink mid.
-    return (
-      m?.twap_initial ??
-      windowMeta?.twap_initial ??
-      (typeof charts?.getTwapInitial === "function" ? charts.getTwapInitial() : null) ??
-      chartOpeningPrice ??
-      null
-    );
+    return m?.twap_initial ?? windowMeta?.twap_initial ?? null;
+  }
+
+  function syncChartTwapTarget(opening) {
+    if (opening == null || !(opening > 0)) return;
+    if (typeof charts?.setTwapInitial === "function") charts.setTwapInitial(opening);
   }
 
   function updateOracleHero(m, windowMeta) {
+    if (!m && !windowMeta) return;
+    if (viewingLive && isStaleClockMarket(m, m?.interval || selected.interval)) return;
     const opening = twapInitialPrice(m, windowMeta);
     const oracle = m?.oracle_price;
     const twap =
@@ -606,6 +823,7 @@
     el("hero-initial").textContent = opening != null ? PM.fmtUsdPrecise(opening) : "—";
     el("hero-current").textContent = oracle != null ? PM.fmtUsd(oracle) : "—";
     el("hero-twap").textContent = twap != null ? PM.fmtUsdPrecise(twap) : "—";
+    syncChartTwapTarget(opening);
 
     const delta = PM.fmtPriceDelta(diff);
     const diffEl = el("hero-diff");
@@ -613,28 +831,109 @@
     diffEl.className = `price-delta ${diff != null ? delta.cls : ""}`;
   }
 
+  function setCandleLast(bar) {
+    const node = el("candle-last");
+    if (!node || !bar) return;
+    const up = bar.close >= bar.open;
+    node.textContent = up ? "UP" : "DOWN";
+    node.classList.toggle("is-up", up);
+    node.classList.toggle("is-down", !up);
+  }
+
+  function applyLiveCandle(market) {
+    if (!candleChart || !market) return;
+    const start = market.start_ts;
+    if (start == null) return;
+    if (liveCandle && liveCandle.time !== start) liveCandle = null;
+    const open = market.twap_initial ?? market.opening_oracle_price ?? market.strike_price;
+    const close = market.oracle_price ?? market.twap_oracle;
+    if (open == null || close == null) return;
+    if (!liveCandle || liveCandle.time !== start) {
+      liveCandle = {
+        time: start,
+        open,
+        high: Math.max(open, close),
+        low: Math.min(open, close),
+        close,
+        slug: market.slug,
+      };
+    } else {
+      liveCandle.open = open;
+      liveCandle.close = close;
+      liveCandle.high = Math.max(liveCandle.high, close, open);
+      liveCandle.low = Math.min(liveCandle.low, close, open);
+      if (market.slug) liveCandle.slug = market.slug;
+    }
+    candleChart.updateLive(liveCandle);
+    setCandleLast(liveCandle);
+  }
+
+  async function loadCandles() {
+    const token = ++candleLoadToken;
+    const title = el("candle-chart-title");
+    if (title) title.textContent = `${selected.interval} candles`;
+    try {
+      const res = await fetch(
+        `/api/candles/${encodeURIComponent(selected.asset)}/${encodeURIComponent(selected.interval)}?limit=180`
+      );
+      if (!res.ok || token !== candleLoadToken) return;
+      const data = await res.json();
+      if (token !== candleLoadToken) return;
+      const last = candleChart?.setCandles(data.items || []);
+      const live = (data.items || []).find((row) => row.live) || last;
+      if (live) {
+        liveCandle = {
+          time: live.time,
+          open: live.open,
+          high: live.high,
+          low: live.low,
+          close: live.close,
+          slug: live.slug,
+        };
+        setCandleLast(live);
+      }
+    } catch (err) {
+      console.error("candles", err);
+    }
+  }
+
+  async function openCandleWindow(meta) {
+    if (!meta?.slug) return;
+    viewingLive = meta.slug === liveSlug;
+    selectedSlug = meta.slug;
+    updateLiveButton();
+    ensureSlugOption(meta.slug, viewingLive ? `${meta.slug} (live)` : meta.slug);
+    const select = el("slug-select");
+    if (select) select.value = meta.slug;
+    const input = el("slug-input");
+    if (input) input.value = meta.slug;
+    try {
+      await loadSlugHistory(meta.slug);
+    } catch (err) {
+      console.error("candle select", err);
+    }
+  }
+
   function startCountdown(endTs) {
     countdownEndTs = endTs || 0;
     if (countdownTimer) clearInterval(countdownTimer);
     const tick = () => {
-      if (!countdownEndTs) {
+      if (viewingLive) {
+        snapToClockWindow();
+        const clock = PM.clockBounds(selected.interval);
+        if (clock?.end) countdownEndTs = clock.end;
+      }
+      const endTsNow = countdownEndTs || activeBounds?.end || 0;
+      if (!endTsNow) {
         setCountdownDigits("—", "—");
         return;
       }
-      const secs = Math.max(0, countdownEndTs - Math.floor(Date.now() / 1000));
+      const secs = Math.max(0, endTsNow - Math.floor(Date.now() / 1000));
       const parts = PM.fmtCountdown(secs);
       setCountdownDigits(parts.mins, parts.secs);
-      if (secs <= 0) {
-        slugRefreshAt = 0;
-        void refreshSlugDropdown(true);
-        if (countdownTimer) {
-          clearInterval(countdownTimer);
-          countdownTimer = null;
-        }
-      }
     };
     tick();
-    countdownTimer = setInterval(tick, 250);
+    countdownTimer = setInterval(tick, 1000);
   }
 
   async function loadSlugHistory(slug) {
@@ -645,14 +944,22 @@
     }
     const data = await res.json();
     const bounds = boundsFromWindow(data.window);
+    if (viewingLive) {
+      const clock = PM.clockBounds(selected.interval);
+      if (clock && bounds?.start && bounds.start !== clock.start) return data;
+    }
     applyBounds(bounds);
     const points = PM.filterPointsForWindow(data.ticks, bounds?.start, bounds?.end);
+    if (!points.length && viewingLive && charts?.hasWindowHistory()) return data;
     setChartOpening(points, bounds?.start);
-    const firstTwap = (data.ticks || []).find((t) => t.twap_oracle != null)?.twap_oracle;
     const last = data.ticks.at(-1);
-    const twapInitial = firstTwap ?? last?.twap_oracle ?? null;
-    // Target line = TWAP initial (not spot strike).
-    setChartHistory(points, twapInitial, bounds, { twap_initial: twapInitial }, data.window);
+    const liveM = marketByKey[`${selected.asset}:${selected.interval}`];
+    const twapInitial =
+      liveM?.twap_initial ?? PM.twapInitialFromPoints(points, bounds?.start);
+    const marketMeta = { twap_initial: twapInitial };
+    if (points.length || !charts?.hasWindowHistory()) {
+      setChartHistory(points, twapInitial, bounds, marketMeta, data.window);
+    }
     updateOracleHero(
       {
         opening_oracle_price: data.window.opening_oracle_price,
@@ -707,9 +1014,11 @@
   async function goLive() {
     const btn = el("slug-live-btn");
     const m = marketByKey[`${selected.asset}:${selected.interval}`];
-    const slug = m?.slug || liveSlug;
+    viewingLive = true;
+    snapToClockWindow();
+    const slug = liveSlug || PM.clockSlug(selected.asset, selected.interval) || m?.slug;
     if (!slug) {
-      alert("No live market available yet");
+      showNotice("No live market available yet");
       return;
     }
 
@@ -717,7 +1026,6 @@
     try {
       liveSlug = slug;
       selectedSlug = slug;
-      viewingLive = true;
       ensureSlugOption(slug, `${slug} (live)`);
       const input = el("slug-input");
       if (input) input.value = slug;
@@ -725,13 +1033,14 @@
       socket.select(selected.asset, selected.interval);
       await loadSlugHistory(slug);
       updateMetrics(m);
-      startCountdown(m?.end_ts);
+      const clock = PM.clockBounds(selected.interval);
+      startCountdown(m?.end_ts && m.start_ts === clock?.start ? m.end_ts : clock?.end);
       document.querySelectorAll(".preview-card").forEach((c) => {
         c.classList.toggle("active", c.dataset.slug === slug);
       });
     } catch (err) {
       console.error("go live", err);
-      alert(err?.message || "Failed to load live market");
+      showNotice(err?.message || "Failed to load live market");
     } finally {
       if (btn) btn.disabled = false;
       updateLiveButton();
@@ -743,10 +1052,11 @@
     const btn = el("slug-load-btn");
     const parsed = parseMarketSlug(input?.value);
     if (!parsed) {
-      alert("Enter a slug like btc-updown-5m-1784264400");
+      showNotice("Enter a slug like btc-updown-5m-1784264400");
       input?.focus();
       return;
     }
+    showNotice("");
 
     if (btn) btn.disabled = true;
     try {
@@ -774,7 +1084,7 @@
       });
     } catch (err) {
       console.error("slug load", err);
-      alert(err?.message || "Failed to load market");
+      showNotice(err?.message || "Failed to load market");
     } finally {
       if (btn) btn.disabled = false;
       updateLiveButton();
@@ -818,7 +1128,7 @@
     // Prev = older markets, Next = newer (toward live).
     if (prevBtn) prevBtn.disabled = !previewHasOlder;
     if (nextBtn) nextBtn.disabled = !previewHasNewer;
-    if (label) label.textContent = `p${previewPage + 1}`;
+    if (label) label.textContent = String(previewPage + 1);
   }
 
   async function loadRecentPreviews(force = false, page = null) {
@@ -842,8 +1152,8 @@
     previewKey = key;
     const list = el("recent-previews");
     if (!list) return;
-    list.innerHTML = `<div class="preview-empty">Loading previews…</div>`;
-    destroyPreviews();
+    const hadCards = !!list.querySelector(".preview-card");
+    if (!hadCards) list.innerHTML = `<div class="preview-empty">Loading previews…</div>`;
     updatePreviewPager();
 
     try {
@@ -867,15 +1177,20 @@
       updatePreviewPager();
 
       if (!payloads.length) {
+        destroyPreviews();
         list.innerHTML = `<div class="preview-empty">${
           previewPage > 0 ? "No older markets" : "No previous markets"
         }</div>`;
         return;
       }
 
-      list.innerHTML = "";
-      payloads.forEach((payload, idx) => {
+      const frag = document.createDocumentFragment();
+      const cards = [];
+      const nowSec = Math.floor(Date.now() / 1000);
+      payloads.forEach((payload) => {
         const w = payload.window || {};
+        // Prefetched next window has no ticks yet — keep it off the sidebar.
+        if (w.start_ts && w.start_ts > nowSec) return;
         const isLiveWindow = !!(w.slug && liveSlug && w.slug === liveSlug);
         const outcome = isLiveWindow
           ? { text: "LIVE", cls: "live" }
@@ -890,7 +1205,7 @@
             <span class="preview-card-time">${fmtPreviewTime(w.end_ts)}</span>
             <span class="preview-card-meta ${outcome.cls}">${outcome.text}</span>
           </div>
-          <div class="preview-chart" id="preview-chart-${idx}"></div>
+          <div class="preview-chart"></div>
           <div class="preview-card-foot">
             <span>${payload.tick_count != null ? payload.tick_count : (payload.ticks || []).length} ticks</span>
             <span class="preview-slug">${(w.slug || "").replace(/^.*?-updown-/, "")}</span>
@@ -919,15 +1234,27 @@
           await loadSlugHistory(w.slug);
           if (viewingLive) updateMetrics(marketByKey[`${selected.asset}:${selected.interval}`]);
         });
-        list.appendChild(card);
-
-        const chartEl = card.querySelector(".preview-chart");
-        const mini = new PM.MiniPreviewChart(chartEl);
-        mini.setData(payload.ticks || []);
-        previewCharts.push(mini);
+        frag.appendChild(card);
+        cards.push({ card, ticks: payload.ticks || [] });
       });
+      if (!cards.length) {
+        destroyPreviews();
+        list.innerHTML = `<div class="preview-empty">${
+          previewPage > 0 ? "No older markets" : "No previous markets"
+        }</div>`;
+        return;
+      }
+      destroyPreviews();
+      list.replaceChildren(frag);
+      for (const item of cards) {
+        const chartEl = item.card.querySelector(".preview-chart");
+        const mini = new PM.MiniPreviewChart(chartEl);
+        mini.setData(item.ticks);
+        previewCharts.push(mini);
+      }
     } catch (err) {
       if (token !== previewLoadToken) return;
+      destroyPreviews();
       list.innerHTML = `<div class="preview-empty">Failed to load previews</div>`;
       previewHasOlder = false;
       previewHasNewer = previewPage > 0;
@@ -978,17 +1305,24 @@
       if (!res.ok) return;
       const markets = await res.json();
       if (!markets?.length) return;
-      marketByKey = PM.marketMap(markets);
+      marketByKey = {};
+      for (const row of markets) applyMarketCard(row);
       renderNav();
       updateSelectedHeader();
-      const m = marketByKey[`${selected.asset}:${selected.interval}`];
-      if (m?.slug && viewingLive) {
-        liveSlug = m.slug;
-        selectedSlug = liveSlug;
-        updateMetrics(m);
-        startCountdown(m.end_ts);
-        updatePolymarketLinks(liveSlug);
-        void loadSlugHistory(liveSlug);
+      if (viewingLive) {
+        snapToClockWindow();
+        const clock = PM.clockBounds(selected.interval);
+        const m = marketByKey[`${selected.asset}:${selected.interval}`];
+        if (m?.slug && m.start_ts && clock && m.start_ts === clock.start) {
+          liveSlug = m.slug;
+          selectedSlug = liveSlug;
+          updateMetrics(m);
+          startCountdown(m.end_ts);
+          updatePolymarketLinks(liveSlug);
+          void loadSlugHistory(liveSlug);
+        } else if (clock) {
+          startCountdown(clock.end);
+        }
       }
       void loadRecentPreviews(true);
     } catch (err) {
@@ -998,27 +1332,26 @@
 
   function updateMetrics(m) {
     if (!m) return;
-    if (m.twap_initial != null && typeof charts?.setTwapInitial === "function") {
-      charts.setTwapInitial(m.twap_initial);
-    }
+    if (viewingLive && isStaleClockMarket(m, m.interval || selected.interval)) return;
     const prob = el("prob-last");
-    if (prob) prob.textContent = `${PM.fmtProb(m.yes_mid)} / ${PM.fmtProb(m.no_mid)}`;
+    if (prob) prob.textContent = fmtQuotePair(m);
     updateOracleHero(m);
   }
 
   function updateSelectedHeader() {
-    const m = marketByKey[`${selected.asset}:${selected.interval}`];
     el("sel-title").textContent = `${selected.asset} Up or Down · ${selected.interval}`;
-    if (m?.slug && viewingLive) {
-      liveSlug = m.slug;
-      if (!selectedSlug || viewingLive) selectedSlug = liveSlug;
-      const bounds = PM.windowBounds(m, selected.interval);
-      applyBounds(bounds);
-      startCountdown(m.end_ts);
-      updateMetrics(m);
-    } else if (viewingLive) {
-      clearCountdown();
-      applyBounds(null);
+    if (viewingLive) {
+      snapToClockWindow();
+      const clock = PM.clockBounds(selected.interval);
+      const m = marketByKey[`${selected.asset}:${selected.interval}`];
+      if (m?.slug && m.start_ts && clock && m.start_ts === clock.start) {
+        liveSlug = m.slug;
+        selectedSlug = liveSlug;
+        updateMetrics(m);
+        startCountdown(m.end_ts || clock.end);
+      } else if (clock) {
+        startCountdown(clock.end);
+      }
     }
     refreshSlugDropdown(false);
     updateChartTitle();
@@ -1062,6 +1395,7 @@
     onOracle: (msg) => {
       scheduleRenderTicker(msg.oracle_prices);
       if (!viewingLive || selectedSlug !== liveSlug || !charts) return;
+      snapToClockWindow();
       const liveTwap = PM.pickTwapPrice(msg, selected.asset, selected.interval);
       charts.updateFeedPrices({
         ts_ms: msg.ts_ms,
@@ -1078,14 +1412,18 @@
           m.twap_oracle = liveTwap;
         }
         // Never seed Initial Price from live TWAP — only true window-open TWAP.
-        if (msg.twap_initial != null && m.twap_initial == null) {
+        if (
+          msg.twap_initial != null &&
+          m.twap_initial == null &&
+          !isStaleClockMarket(m, selected.interval)
+        ) {
           m.twap_initial = msg.twap_initial;
         }
       }
       updateOracleHero(m);
     },
     onSnapshot: (msg) => {
-      marketByKey = PM.marketMap(msg.markets);
+      for (const row of msg.markets || []) applyMarketCard(row);
       scheduleRenderTicker(msg.oracle_prices);
       renderNav();
       updateSelectedHeader();
@@ -1099,15 +1437,16 @@
           msg.start_ts && msg.end_ts
             ? { start: msg.start_ts, end: msg.end_ts }
             : marketBounds(m, selected.interval);
+        const clock = PM.clockBounds(selected.interval);
+        if (clock && bounds?.start && bounds.start !== clock.start) return;
 
         let points = PM.filterPointsForWindow(msg.points, bounds?.start, bounds?.end);
         if (!points.length && msg.slug) {
-          if (charts?.hasLiveData()) return;
-          await loadSlugHistory(msg.slug);
+          if (!charts?.hasWindowHistory()) await loadSlugHistory(msg.slug);
           return;
         }
 
-        if (charts?.hasLiveData()) {
+        if (charts?.hasWindowHistory()) {
           if (bounds) {
             applyBounds(bounds, false, chartOpenings(points, bounds?.start, m, {
               strike_price: msg.strike_price,
@@ -1142,25 +1481,26 @@
     },
     onTick: (msg) => {
       const key = `${msg.asset}:${msg.interval}`;
-      if (msg.market) marketByKey[key] = msg.market;
       if (msg.asset === selected.asset && msg.interval === selected.interval) {
-        if (msg.market?.slug) {
-          const slugChanged = liveSlug && liveSlug !== msg.market.slug;
-          liveSlug = msg.market.slug;
+        snapToClockWindow();
+        const clock = PM.clockBounds(selected.interval);
+        if (msg.market?.start_ts && clock && msg.market.start_ts < clock.start) {
+          scheduleRenderTicker();
+          scheduleNavBadges();
+          return;
+        }
+        const adopted = msg.market ? applyMarketCard(msg.market) : marketByKey[key];
+        if (adopted) applyLiveCandle(adopted);
+        if (adopted?.slug) {
+          const slugChanged = liveSlug && liveSlug !== adopted.slug;
+          liveSlug = adopted.slug;
           if (viewingLive) selectedSlug = liveSlug;
-          if (slugChanged) {
-            void handleWindowRoll(msg.market);
-          } else {
-            updatePolymarketLinks(liveSlug);
-          }
+          if (slugChanged) handleWindowRoll(adopted);
+          else updatePolymarketLinks(liveSlug);
         }
         if (viewingLive && selectedSlug === liveSlug) {
-          const bounds = marketBounds(msg.market, selected.interval);
-          if (bounds && (!activeBounds || activeBounds.start !== bounds.start)) {
-            applyBounds(bounds, false);
-          }
-          if (msg.point && charts) {
-            // YES/NO immediately; also refresh spot/TWAP from the same tick if present.
+          const bounds = activeBounds || marketBounds(adopted, selected.interval);
+          if (msg.point && charts && pointInLiveBounds(msg.point, bounds)) {
             charts.appendProbPoint(msg.point);
             if (
               msg.point.oracle_price != null ||
@@ -1175,12 +1515,17 @@
               });
             }
           }
-          scheduleUpdateMetrics(msg.market);
-          if (msg.market?.end_ts) countdownEndTs = msg.market.end_ts;
+          scheduleUpdateMetrics(adopted);
+          if (adopted?.end_ts && (!clock || adopted.end_ts >= clock.end)) {
+            countdownEndTs = adopted.end_ts;
+          }
           if (msg.point) {
-            el("prob-last").textContent = `${PM.fmtProb(msg.point.yes_mid)} / ${PM.fmtProb(msg.point.no_mid)}`;
+            const prob = el("prob-last");
+            if (prob) prob.textContent = fmtQuotePair(adopted);
           }
         }
+      } else if (msg.market) {
+        applyMarketCard(msg.market);
       }
       scheduleRenderTicker();
       scheduleNavBadges();
@@ -1200,7 +1545,15 @@
       throw new Error("LightweightCharts failed to load");
     }
     charts = new PM.DualCharts(el("chart-oracle"), el("chart-prob"));
+    const candleEl = el("chart-candles");
+    if (candleEl) {
+      candleChart = new PM.CandleChart(candleEl);
+      candleChart.onSelect = (meta) => {
+        void openCandleWindow(meta);
+      };
+    }
     updateTwapLabels();
+    void loadCandles();
   } catch (err) {
     console.error("chart init failed", err);
     charts = null;

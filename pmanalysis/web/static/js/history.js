@@ -26,11 +26,32 @@ function setFiltersForTab(tab) {
   replay.classList.toggle("hidden", tab !== "windows");
 }
 
+function syncRawTabs(stats) {
+  const hasRaw = Boolean(
+    stats?.feed_record ||
+      stats?.binance_trade_count ||
+      stats?.oracle_tick_count ||
+      stats?.clob_quote_count
+  );
+  document.querySelectorAll(".history-tab[data-raw]").forEach((btn) => {
+    btn.classList.toggle("hidden", !hasRaw);
+  });
+  if (!hasRaw && currentTab !== "windows") {
+    currentTab = "windows";
+    document.querySelectorAll(".history-tab").forEach((btn) => {
+      btn.classList.toggle("active", btn.dataset.tab === "windows");
+    });
+    pageOffset = 0;
+  }
+  return hasRaw;
+}
+
 async function loadStats() {
   const el = document.getElementById("history-stats");
   try {
     const res = await fetch("/api/feeds/stats");
     const s = await res.json();
+    syncRawTabs(s);
     el.innerHTML = [
       ["Windows", s.window_count],
       ["Ticks (1s)", s.tick_count],
@@ -45,6 +66,43 @@ async function loadStats() {
       .join("");
   } catch (err) {
     el.textContent = `Failed to load counts: ${err.message}`;
+  }
+}
+
+function winRateChip(row, highlight) {
+  const rate = row.win_rate_up_pct;
+  const rateText = rate == null ? "—" : `${rate.toFixed(1)}%`;
+  const tone = rate == null ? "" : rate >= 50 ? "win-up" : "win-down";
+  const active = highlight ? " is-active" : "";
+  return `<div class="stat-chip win-chip ${tone}${active}">
+    <span class="stat-label">${row.asset} · ${row.interval}</span>
+    <span class="stat-value">${rateText}</span>
+    <span class="stat-sub">${fmtNum(row.up)} UP / ${fmtNum(row.down)} DOWN · ${fmtNum(row.resolved)} resolved</span>
+  </div>`;
+}
+
+async function loadWinRates() {
+  const el = document.getElementById("win-rate-stats");
+  if (!el) return;
+  try {
+    const res = await fetch("/api/stats");
+    const data = await res.json();
+    const asset = document.getElementById("filter-asset").value;
+    const interval = document.getElementById("filter-interval").value;
+    const items = data.items || [];
+    const filtered = items.filter((row) => {
+      if (asset && row.asset !== asset) return false;
+      if (interval && row.interval !== interval) return false;
+      return true;
+    });
+    if (!filtered.length) {
+      el.textContent = "No resolved windows yet.";
+      return;
+    }
+    const highlightOne = Boolean(asset && interval);
+    el.innerHTML = filtered.map((row) => winRateChip(row, highlightOne)).join("");
+  } catch (err) {
+    el.textContent = `Failed to load win rates: ${err.message}`;
   }
 }
 
@@ -101,28 +159,52 @@ async function loadWindows() {
   document.querySelectorAll("a[data-slug]").forEach((el) => {
     el.addEventListener("click", async (e) => {
       e.preventDefault();
+      document.querySelectorAll("#history-table tbody tr").forEach((row) => {
+        row.classList.remove("is-selected");
+      });
+      el.closest("tr")?.classList.add("is-selected");
+      const title = document.getElementById("replay-title");
+      if (title) title.textContent = el.dataset.slug;
       const tickRes = await fetch(
         `/api/windows/${encodeURIComponent(el.dataset.slug)}/ticks`
       );
       const tickData = await tickRes.json();
+      if (!tickRes.ok || !tickData.window) {
+        if (title) title.textContent = "Window not found";
+        return;
+      }
       if (!replayCharts) {
         replayCharts = new PM.DualCharts(
           document.getElementById("replay-oracle"),
           document.getElementById("replay-prob")
         );
       }
-      const points = tickData.ticks.map((t) => ({
+      const points = (tickData.ticks || []).map((t) => ({
         ts_ms: t.ts_ms,
         oracle_price: t.oracle_price,
         binance_price: t.binance_price,
+        twap_oracle: t.twap_oracle,
+        yes_ask: t.yes_ask,
+        no_ask: t.no_ask,
         yes_mid: t.yes_mid,
         no_mid: t.no_mid,
       }));
+      const startTs = tickData.window.start_ts;
+      const twapInitial = PM.twapInitialFromPoints(points, startTs);
       replayCharts.setHistory(
         points,
-        tickData.window.strike_price,
-        tickData.window.interval || "5m"
+        twapInitial ?? tickData.window.strike_price,
+        startTs,
+        tickData.window.end_ts,
+        tickData.window.opening_oracle_price ?? null,
+        PM.openingBinanceFromPoints(points, startTs),
+        PM.openingProbFromPoints(points, startTs),
+        twapInitial
       );
+      document.getElementById("replay-panel")?.scrollIntoView({
+        behavior: "smooth",
+        block: "nearest",
+      });
     });
   });
 }
@@ -222,58 +304,14 @@ async function loadHistory() {
   else if (currentTab === "clob") await loadClob();
 }
 
-async function clearDatabase() {
-  const ok = window.confirm(
-    "Delete ALL collected data?\n\n" +
-      "This removes every window, tick, indicator, Binance/oracle/CLOB stream, archive, and export.\n" +
-      "Market definitions are kept. This cannot be undone."
-  );
-  if (!ok) return;
-
-  const password = window.prompt("Enter admin password to confirm:");
-  if (password === null) return;
-
-  const btn = document.getElementById("clear-db-btn");
-  btn.disabled = true;
-  btn.textContent = "Clearing…";
-  try {
-    const res = await fetch("/api/admin/clear-db", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ password }),
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || "Clear failed");
-    if (replayCharts) {
-      replayCharts.destroy();
-      replayCharts = null;
-    }
-    pageOffset = 0;
-    await loadStats();
-    await loadHistory();
-    alert(
-      "Database cleared.\n" +
-        `Windows: ${data.cleared?.windows ?? 0}\n` +
-        `Ticks: ${data.cleared?.ticks ?? 0}\n` +
-        `Binance: ${data.cleared?.binance_trades ?? 0}\n` +
-        `Oracle: ${data.cleared?.oracle_ticks ?? 0}\n` +
-        `CLOB: ${data.cleared?.clob_quotes ?? 0}`
-    );
-  } catch (err) {
-    alert(`Clear failed: ${err.message}`);
-  } finally {
-    btn.disabled = false;
-    btn.textContent = "Clear Database";
-  }
-}
-
-document.getElementById("clear-db-btn").addEventListener("click", clearDatabase);
 document.getElementById("filter-asset").addEventListener("change", () => {
   pageOffset = 0;
+  loadWinRates();
   loadHistory();
 });
 document.getElementById("filter-interval").addEventListener("change", () => {
   pageOffset = 0;
+  loadWinRates();
   loadHistory();
 });
 document.getElementById("filter-side").addEventListener("change", () => {
@@ -304,4 +342,5 @@ document.querySelectorAll(".history-tab").forEach((btn) => {
 });
 
 loadStats();
+loadWinRates();
 loadHistory();
