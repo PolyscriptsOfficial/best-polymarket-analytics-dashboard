@@ -11,7 +11,7 @@ from typing import Callable
 import httpx
 import websockets
 
-from pmanalysis.config import CLOB_API, CLOB_WS_URL
+from pmanalysis.config import BOOK_DEPTH_BAND_CENTS, CLOB_API, CLOB_WS_URL
 
 log = logging.getLogger(__name__)
 
@@ -157,11 +157,82 @@ def parse_clob_ws(msg) -> list[dict]:
     return out
 
 
+def _levels(raw_levels) -> dict[float, float]:
+    out: dict[float, float] = {}
+    for level in raw_levels or []:
+        try:
+            price = round(float(level["price"]) * 100, 1)
+            size = float(level["size"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if size > 0:
+            out[price] = size
+    return out
+
+
+class TokenBook:
+    """Aggregated price levels for one outcome token (prices in cents, sizes in shares)."""
+
+    __slots__ = ("bids", "asks")
+
+    def __init__(self) -> None:
+        self.bids: dict[float, float] = {}
+        self.asks: dict[float, float] = {}
+
+    def replace(self, book: dict) -> None:
+        self.bids = _levels(book.get("bids"))
+        self.asks = _levels(book.get("asks"))
+
+    def set_level(self, side: str, price_cents: float, size: float) -> None:
+        levels = self.bids if side == "BUY" else self.asks
+        if size > 0:
+            levels[price_cents] = size
+        else:
+            levels.pop(price_cents, None)
+
+    def stats(self, best_ask: float, best_bid: float, band: float) -> dict:
+        """Size at the best quote and depth within ``band`` cents of it."""
+        ask_size = self.asks.get(best_ask) if best_ask > 0 else None
+        bid_size = self.bids.get(best_bid) if best_bid > 0 else None
+        ask_depth = (
+            round(sum(s for p, s in self.asks.items() if p <= best_ask + band), 2)
+            if best_ask > 0 and self.asks
+            else None
+        )
+        bid_depth = (
+            round(sum(s for p, s in self.bids.items() if p >= best_bid - band), 2)
+            if best_bid > 0 and self.bids
+            else None
+        )
+        return {
+            "ask_size": ask_size,
+            "bid_size": bid_size,
+            "ask_depth": ask_depth,
+            "bid_depth": bid_depth,
+        }
+
+
+class TradeTape:
+    """Last trade price and cumulative traded notional for one token."""
+
+    __slots__ = ("last_price", "notional")
+
+    def __init__(self) -> None:
+        self.last_price: float | None = None
+        self.notional = 0.0
+
+    def add(self, price_cents: float, size: float) -> None:
+        self.last_price = price_cents
+        self.notional += price_cents / 100.0 * size
+
+
 class ClobFeed:
     def __init__(self) -> None:
         self._client = httpx.AsyncClient(timeout=httpx.Timeout(8.0))
         self._prices: dict[str, dict[str, float]] = {}
         self._last_update: dict[str, float] = {}
+        self._books: dict[str, TokenBook] = {}
+        self._trades: dict[str, TradeTape] = {}
         self._running = False
         self._connected = False
 
@@ -186,7 +257,73 @@ class ClobFeed:
         response = await self._client.get(f"{CLOB_API}/book", params={"token_id": token_id})
         data = response.json()
         best_ask, best_bid = book_to_cents(data)
+        if isinstance(data, dict):
+            self._book_for(token_id).replace(data)
         return {"best_ask": best_ask, "best_bid": best_bid, "raw": data}
+
+    def _book_for(self, token_id: str) -> TokenBook:
+        book = self._books.get(token_id)
+        if book is None:
+            book = self._books[token_id] = TokenBook()
+        return book
+
+    def apply_book_events(self, msg) -> None:
+        """Maintain per-token depth and trade tapes from market-channel events.
+
+        ``book`` replaces a token's levels, ``price_change`` sets one level's
+        aggregate size (0 removes it), ``last_trade_price`` records a fill.
+        """
+        items = msg if isinstance(msg, list) else [msg]
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            event_type = item.get("event_type")
+            if event_type == "book" or (
+                event_type is None and item.get("asset_id") and "asks" in item
+            ):
+                token_id = str(item.get("asset_id", ""))
+                if token_id:
+                    self._book_for(token_id).replace(item)
+            elif event_type == "price_change":
+                for change in item.get("price_changes", []):
+                    token_id = str(change.get("asset_id", ""))
+                    side = str(change.get("side", "")).upper()
+                    try:
+                        price = round(float(change["price"]) * 100, 1)
+                        size = float(change["size"])
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if token_id and side in ("BUY", "SELL"):
+                        self._book_for(token_id).set_level(side, price, size)
+            elif event_type == "last_trade_price":
+                token_id = str(item.get("asset_id", ""))
+                try:
+                    price = round(float(item["price"]) * 100, 1)
+                    size = float(item["size"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if token_id and size > 0:
+                    tape = self._trades.get(token_id)
+                    if tape is None:
+                        tape = self._trades[token_id] = TradeTape()
+                    tape.add(price, size)
+
+    def book_stats(self, token_id: str) -> dict:
+        """Best-level size and banded depth for a token (None when unknown)."""
+        best_ask, best_bid = self.get_quote(token_id)
+        book = self._books.get(token_id)
+        if book is None:
+            return {"ask_size": None, "bid_size": None, "ask_depth": None, "bid_depth": None}
+        return book.stats(best_ask, best_bid, BOOK_DEPTH_BAND_CENTS)
+
+    def last_trade(self, token_id: str) -> float | None:
+        tape = self._trades.get(token_id)
+        return tape.last_price if tape else None
+
+    def traded_notional(self, token_id: str) -> float:
+        """Cumulative USDC traded on this token since subscription."""
+        tape = self._trades.get(token_id)
+        return tape.notional if tape else 0.0
 
     def apply_quote(self, token_id: str, best_ask: float, best_bid: float) -> bool:
         """Merge partial quote updates; return True if visible prices changed."""
@@ -198,6 +335,11 @@ class ClobFeed:
             return False
         self._prices[token_id] = {"best_ask": ask, "best_bid": bid}
         return True
+
+    def quote_age_sec(self, token_id: str) -> float | None:
+        """Seconds since this token's quote was last confirmed (WS or REST)."""
+        last = self._last_update.get(token_id)
+        return None if last is None else time.monotonic() - last
 
     def stale_tokens(self, token_ids: list[str], max_age_sec: float) -> list[str]:
         """Token ids with no WS quote (or none at all) within max_age_sec.
@@ -306,6 +448,7 @@ class ClobFeed:
                             except json.JSONDecodeError:
                                 continue
 
+                            self.apply_book_events(payload)
                             updates = parse_clob_ws(payload)
                             changed: list[dict] = []
                             for upd in updates:
@@ -340,3 +483,17 @@ class ClobFeed:
     def get_quote(self, token_id: str) -> tuple[float, float]:
         quote = self._prices.get(token_id, {})
         return quote.get("best_ask", 0.0), quote.get("best_bid", 0.0)
+
+    def prune_quotes(self, keep_token_ids: set[str] | list[str]) -> int:
+        """Drop cached quotes for tokens we no longer subscribe to (bounded memory)."""
+        keep = set(keep_token_ids)
+        removed = 0
+        for token_id in list(self._prices.keys()):
+            if token_id not in keep:
+                self._prices.pop(token_id, None)
+                self._last_update.pop(token_id, None)
+                removed += 1
+        for cache in (self._books, self._trades):
+            for token_id in [t for t in cache if t not in keep]:
+                cache.pop(token_id, None)
+        return removed
