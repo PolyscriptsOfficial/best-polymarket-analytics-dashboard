@@ -1,6 +1,7 @@
 from pmanalysis.feeds.gamma import strike_to_float
 from pmanalysis.feeds.slugs import boundary_ts
-from pmanalysis.indicators.compute import IndicatorState, compute_tick_fields, win_rate
+from pmanalysis.analytics.live import LiveAnalytics
+from pmanalysis.indicators.compute import compute_tick_fields, win_rate
 
 
 def test_boundary_ts_5m():
@@ -25,37 +26,16 @@ def test_compute_tick_fields():
     assert fields["dist_from_strike"] == 18.0
 
 
-def test_indicator_state_momentum():
-    state = IndicatorState()
-    state.add_oracle(1_000, 100.0)
-    state.add_oracle(61_000, 101.5)
-    out = state.compute(
-        ts_ms=61_000,
-        yes_mid=0.52,
-        no_mid=0.48,
-        combined_ask=100.0,
-        window_duration=300,
-        secs_remaining=100,
-    )
-    assert out["momentum_1m"] == 1.5
-
-
-def test_indicator_state_local_twap_helpers():
-    """Local helpers remain for tests; production TWAP comes from Chainlink RTDS."""
-    state = IndicatorState()
-    state.add_oracle(0, 100.0)
-    state.add_oracle(10_000, 110.0)
-    assert state.twap_oracle(10_000) == 100.0
-    assert state.twap_oracle(20_000) == 105.0
-    out = state.compute(
-        ts_ms=20_000,
-        yes_mid=0.5,
-        no_mid=0.5,
-        combined_ask=100.0,
-        window_duration=300,
-        secs_remaining=200,
-    )
-    assert out["twap_oracle"] is None
+def test_sigma_ignores_push_rate():
+    """Repeated same-second updates must not distort the per-second volatility."""
+    once, burst = LiveAnalytics(("BTC",)), LiveAnalytics(("BTC",))
+    for sec in range(0, 300):
+        price = 100.0 + (sec % 2) * 0.1
+        once.on_chainlink("BTC", sec * 1000, price)
+        for _ in range(5):  # five live pushes per second
+            burst.on_chainlink("BTC", sec * 1000, price)
+    assert once.sigma("BTC", 299) is not None
+    assert burst.sigma("BTC", 299) == once.sigma("BTC", 299)
 
 
 def test_win_rate():
