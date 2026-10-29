@@ -7,12 +7,15 @@ from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 
 from pmanalysis.candles import seal_window_candle
+from pmanalysis.collector.resolution import apply_resolution, windows_to_recheck
 from pmanalysis.config import (
     INTERVAL_SECONDS,
     MARKET_SLUGS,
     RESOLUTION_MAX_WAIT_SEC,
+    RESOLUTION_RECHECK_HOURS,
     ROLL_PREFETCH_SEC,
 )
+from pmanalysis.db.features import boundary_twap
 from pmanalysis.db.models import Market, Window
 from pmanalysis.feeds.chainlink import ChainlinkFeed
 from pmanalysis.feeds.gamma import DiscoveredWindow, GammaClient, strike_to_float
@@ -21,6 +24,7 @@ from pmanalysis.collector.window_cache import CachedWindow
 from pmanalysis.feeds.opening_price import (
     apply_opening_price,
     capture_final_oracle_price,
+    capture_final_twap,
     oracle_from_ticks_at_end,
     seed_opening_from_previous,
 )
@@ -229,6 +233,7 @@ class WindowManager:
                 prev_row = session.query(Window).filter_by(id=prev_id).first()
                 if chainlink and prev_row:
                     capture_final_oracle_price(session, prev_row, chainlink)
+                    capture_final_twap(session, prev_row, chainlink)
                     seed_opening_from_previous(session, target, chainlink)
         session.commit()
         return rolled
@@ -276,6 +281,7 @@ class WindowManager:
                 rolled.append((item.asset, item.interval, prev_id))
                 if chainlink and prev_row:
                     capture_final_oracle_price(session, prev_row, chainlink)
+                    capture_final_twap(session, prev_row, chainlink)
                     seed_opening_from_previous(session, window, chainlink)
         session.commit()
         return self.subscription_token_ids(session, now_ts), rolled
@@ -326,14 +332,11 @@ class WindowManager:
         """Resolve+finalize windows past end_ts+grace that aren't resolved yet.
 
         Queries `resolved_at IS NULL` directly instead of iterating
-        `_active_ids`: the next window's roll discovery replaces
-        `_active_ids[key]` almost immediately at the boundary (often before
-        this runs), so relying on `_active_ids` alone meant an expired window
-        could silently fall out of tracking and never get resolved. Gamma also
-        frequently hasn't published a winner within the old fixed grace
-        period, which froze `outcome=None` forever; we now retry for up to
-        `RESOLUTION_MAX_WAIT_SEC` before falling back to a final-oracle vs
-        strike comparison.
+        `_active_ids`: the roll replaces `_active_ids[key]` at the boundary,
+        often before this runs. Gamma is retried for up to
+        `RESOLUTION_MAX_WAIT_SEC`; after that the window resolves on our own
+        TWAP inference (see collector/resolution.py), which
+        `recheck_inferred` later reconciles against Gamma.
         """
         finalized: list[Window] = []
         candidates = (
@@ -349,20 +352,16 @@ class WindowManager:
 
             if chainlink:
                 capture_final_oracle_price(session, window, chainlink)
+                capture_final_twap(session, window, chainlink)
             elif window.final_oracle_price is None:
                 final = oracle_from_ticks_at_end(session, window.id, window.end_ts)
                 if final is not None:
                     window.final_oracle_price = final
 
-            if outcome:
-                window.outcome = outcome
-            elif window.strike_price is not None and window.final_oracle_price is not None:
-                # Gamma fallback: infer from final oracle vs strike (best-effort,
-                # matches Polymarket's own crypto up/down settlement rule).
-                window.outcome = (
-                    "UP" if window.final_oracle_price > window.strike_price else "DOWN"
-                )
-
+            if window.twap_initial is None:
+                # Missed the open (e.g. restart): the previous close is the same boundary.
+                window.twap_initial = boundary_twap(session, window)
+            apply_resolution(window, outcome)
             window.resolved_at = datetime.now(timezone.utc)
             session.add(window)
             seal_window_candle(session, window)
@@ -372,6 +371,22 @@ class WindowManager:
                 del self._active_ids[key]
         session.commit()
         return finalized
+
+    async def recheck_inferred(self, session: Session, now_ts: int) -> list[Window]:
+        """Ask Gamma again for windows resolved on inference; flag disagreements."""
+        changed: list[Window] = []
+        for window in windows_to_recheck(session, now_ts, RESOLUTION_RECHECK_HOURS * 3600):
+            outcome, _ = await self.gamma.fetch_resolution(window.slug)
+            if not outcome:
+                continue
+            apply_resolution(window, outcome)
+            # Bump resolved_at so dataset fingerprints (max resolved_at) rebuild.
+            window.resolved_at = datetime.now(timezone.utc)
+            session.add(window)
+            changed.append(window)
+        if changed:
+            session.commit()
+        return changed
 
     def window_duration(self, window: Window | CachedWindow) -> int:
         return INTERVAL_SECONDS.get(window.interval, window.end_ts - window.start_ts)

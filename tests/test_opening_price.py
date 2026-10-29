@@ -52,8 +52,6 @@ def test_oracle_from_ticks_accepts_late_first_tick():
                 window_id=window.id,
                 ts_ms=1_000_003_500,
                 oracle_price=100.5,
-                yes_mid=0.5,
-                no_mid=0.5,
             )
         )
         session.flush()
@@ -83,8 +81,6 @@ def test_oracle_from_ticks_at_start_uses_boundary_tick():
                 window_id=window.id,
                 ts_ms=999_998_000,
                 oracle_price=98.0,
-                yes_mid=0.5,
-                no_mid=0.5,
             )
         )
         session.add(
@@ -92,8 +88,6 @@ def test_oracle_from_ticks_at_start_uses_boundary_tick():
                 window_id=window.id,
                 ts_ms=1_000_001_000,
                 oracle_price=100.5,
-                yes_mid=0.5,
-                no_mid=0.5,
             )
         )
         session.flush()
@@ -123,8 +117,6 @@ def test_oracle_from_ticks_at_end_uses_last_tick_before_boundary():
                 window_id=window.id,
                 ts_ms=1_000_299_500,
                 oracle_price=101.25,
-                yes_mid=0.5,
-                no_mid=0.5,
             )
         )
         session.add(
@@ -132,8 +124,6 @@ def test_oracle_from_ticks_at_end_uses_last_tick_before_boundary():
                 window_id=window.id,
                 ts_ms=1_000_300_000,
                 oracle_price=101.50,
-                yes_mid=0.5,
-                no_mid=0.5,
             )
         )
         session.flush()
@@ -164,8 +154,6 @@ def test_seed_opening_from_previous_window():
                 window_id=prev.id,
                 ts_ms=1_000_299_800,
                 oracle_price=61777.99,
-                yes_mid=0.5,
-                no_mid=0.5,
             )
         )
         nxt = Window(
@@ -184,3 +172,28 @@ def test_seed_opening_from_previous_window():
         assert nxt.strike_price == 61777.99
         assert nxt.strike_source == "prev_window_close"
         assert prev.final_oracle_price == 61777.99
+
+
+def test_capture_final_twap_takes_the_settled_boundary_sample():
+    from pmanalysis.db.models import Window
+    from pmanalysis.feeds.opening_price import capture_final_twap
+
+    class Feed:
+        value = 100.0
+
+        def get_twap_opening(self, asset, ts, window_s=None):
+            return self.value
+
+    class Session:
+        def add(self, _obj):
+            pass
+
+    feed, session = Feed(), Session()
+    window = Window(slug="w", asset="BTC", interval="5m", start_ts=0, end_ts=300)
+    assert capture_final_twap(session, window, feed) is True  # at the roll
+    feed.value = 100.25  # exact boundary sample arrives late
+    assert capture_final_twap(session, window, feed) is True  # refreshed at finalize
+    assert window.final_twap == 100.25
+    feed.value = None  # RTDS buffer rolled off: keep what we have
+    assert capture_final_twap(session, window, feed) is False
+    assert window.final_twap == 100.25

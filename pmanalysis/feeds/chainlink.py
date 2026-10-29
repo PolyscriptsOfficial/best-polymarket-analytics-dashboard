@@ -168,6 +168,7 @@ class ChainlinkFeed:
     def __init__(self, twap_window_sec: int = TWAP_WINDOW_SEC) -> None:
         self.twap_window_sec = 60 if twap_window_sec not in (30, 60) else twap_window_sec
         self._chainlink_prices: dict[str, float] = {}
+        self._rest_client: httpx.AsyncClient | None = None
         self._fallback_prices: dict[str, float] = {}
         self._twap_prices: dict[str, dict[int, float]] = {
             a: {} for a in _CHAINLINK_SYMBOL_ASSET.values()
@@ -231,6 +232,9 @@ class ChainlinkFeed:
 
     async def close(self) -> None:
         self._running = False
+        if self._rest_client is not None:
+            await self._rest_client.aclose()
+            self._rest_client = None
 
     def _emit_tick(self, tick: dict) -> None:
         if self._on_tick:
@@ -296,11 +300,20 @@ class ChainlinkFeed:
     async def _rest_poll_loop(self) -> None:
         """Binance REST fallback when RTDS is rate-limited or down."""
         while self._running:
+            missing = [
+                (asset, symbol)
+                for asset, symbol in _REST_SYMBOLS.items()
+                if asset not in self._chainlink_prices
+            ]
             try:
-                async with httpx.AsyncClient(timeout=8.0) as client:
-                    for asset, symbol in _REST_SYMBOLS.items():
-                        if asset in self._chainlink_prices:
-                            continue
+                if missing:
+                    # One client for the feed's lifetime: building an AsyncClient
+                    # loads the CA bundle (~150 ms of CPU on the event loop), and
+                    # doing that every poll starved the CLOB WebSocket reader.
+                    if self._rest_client is None:
+                        self._rest_client = httpx.AsyncClient(timeout=8.0)
+                    client = self._rest_client
+                    for asset, symbol in missing:
                         resp = await client.get(
                             "https://api.binance.com/api/v3/ticker/price",
                             params={"symbol": symbol},

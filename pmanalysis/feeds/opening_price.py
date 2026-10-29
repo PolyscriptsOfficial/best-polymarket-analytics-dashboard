@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
+from pmanalysis.config import SNAPSHOT_TOLERANCE_SEC, TWAP_WINDOW_SEC
 from pmanalysis.db.models import Tick, Window
 from pmanalysis.feeds.chainlink import ChainlinkFeed
 from pmanalysis.feeds.gamma import GammaClient
@@ -141,6 +142,44 @@ def capture_final_oracle_price(
     if price is None or window.final_oracle_price == price:
         return False
     window.final_oracle_price = price
+    session.add(window)
+    return True
+
+
+def capture_final_twap(
+    session: Session,
+    window: Window,
+    chainlink: ChainlinkFeed,
+) -> bool:
+    """Persist the settling 60s TWAP at window end. Returns True if changed.
+
+    The close boundary is the next window's open, so the RTDS boundary capture
+    used for the opening TWAP also gives the final one. Called at the roll and
+    again at finalize: the exact boundary sample often arrives a second or two
+    late and replaces a provisional neighbour, so a live RTDS value always
+    overwrites. Without one, falls back to the last stored 1s tick within the
+    snapshot tolerance before end_ts (only when nothing was captured).
+    """
+    price = chainlink.get_twap_opening(window.asset, window.end_ts, TWAP_WINDOW_SEC)
+    if price is None and window.final_twap is not None:
+        return False
+    if price is None:
+        end_ms = window.end_ts * 1000
+        row = (
+            session.query(Tick.twap_oracle)
+            .filter(
+                Tick.window_id == window.id,
+                Tick.ts_ms <= end_ms,
+                Tick.ts_ms >= end_ms - SNAPSHOT_TOLERANCE_SEC * 1000,
+                Tick.twap_oracle.isnot(None),
+            )
+            .order_by(Tick.ts_ms.desc())
+            .first()
+        )
+        price = row[0] if row else None
+    if price is None or price == window.final_twap:
+        return False
+    window.final_twap = price
     session.add(window)
     return True
 

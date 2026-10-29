@@ -20,6 +20,7 @@ class CachedWindow:
     end_ts: int
     strike_price: float | None
     opening_oracle_price: float | None
+    twap_initial: float | None
     outcome: str | None
 
     @classmethod
@@ -36,5 +37,6 @@ class CachedWindow:
             end_ts=row.end_ts,
             strike_price=row.strike_price,
             opening_oracle_price=row.opening_oracle_price,
+            twap_initial=row.twap_initial,
             outcome=row.outcome,
         )

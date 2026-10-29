@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 
@@ -16,6 +17,21 @@ INTERVAL_VARIANT = {
     "5m": "fiveminute",
     "15m": "fifteen",
 }
+
+
+# One AsyncClient per event loop. Building a client loads the CA bundle
+# (~150 ms of CPU on the loop) and this runs on every opening-price attempt.
+_CLIENTS: dict[int, httpx.AsyncClient] = {}
+
+
+def _client() -> httpx.AsyncClient:
+    loop_id = id(asyncio.get_running_loop())
+    client = _CLIENTS.get(loop_id)
+    if client is None or client.is_closed:
+        # A new loop (e.g. a fresh asyncio.run) cannot use another loop's client.
+        _CLIENTS.clear()
+        client = _CLIENTS[loop_id] = httpx.AsyncClient(timeout=httpx.Timeout(10.0))
+    return client
 
 
 def _iso_utc(ts_sec: int) -> str:
@@ -50,12 +66,11 @@ async def fetch_price_to_beat(
     }
 
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
-            response = await client.get(PAST_RESULTS_URL, params=params)
-            if response.status_code != 200:
-                log.debug("past-results %s: %s", response.status_code, response.text[:120])
-                return None, None
-            payload = response.json()
+        response = await _client().get(PAST_RESULTS_URL, params=params)
+        if response.status_code != 200:
+            log.debug("past-results %s: %s", response.status_code, response.text[:120])
+            return None, None
+        payload = response.json()
     except Exception as exc:
         log.debug("past-results fetch failed: %s", exc)
         return None, None
