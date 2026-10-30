@@ -32,7 +32,9 @@ class GapTracker:
         )
         self._open_ids = {row.source: row.id for row in rows}
 
-    def reconcile(self, session: Session, feeds: list[dict]) -> None:
+    def reconcile(self, session: Session, feeds: list[dict]) -> list[tuple[str, str]]:
+        """Open/close gap rows; return (source, message) for gaps opened now."""
+        opened: list[tuple[str, str]] = []
         for feed in feeds:
             source = feed["source"]
             message = _gap_message(feed)
@@ -47,6 +49,7 @@ class GapTracker:
                     session.add(gap)
                     session.flush()
                     self._open_ids[source] = gap.id
+                    opened.append((source, message))
                 else:
                     row = session.get(CollectorGap, open_id)
                     if row is not None and row.message != message:
@@ -57,6 +60,7 @@ class GapTracker:
                     row.ended_at = _utcnow()
                 self._open_ids.pop(source, None)
         session.flush()
+        return opened
 
 
 def _gap_message(feed: dict) -> str:

@@ -84,26 +84,73 @@ FEED_LAG_SEC = {
 
 # 0.0.0.0 = listen on all interfaces (VPS / remote access). Override: PM_HOST=127.0.0.1
 WEB_HOST = os.getenv("PM_HOST", "0.0.0.0")
-WEB_PORT = int(os.getenv("PM_PORT", "8000"))
+WEB_PORT = int(os.getenv("PM_PORT", "8420"))
 
 DATASET_TTL_DAYS = int(os.getenv("PM_DATASET_TTL_DAYS", "7"))
-DATASET_MAX_RANGE_DAYS = int(os.getenv("PM_DATASET_MAX_RANGE_DAYS", "366"))
+# Public downloads (UI + /v1 API) only reach back this many days (from UTC
+# midnight); older data is shared on request (OWNER_CONTACT). One request may
+# span the whole window: the full past days plus today.
+DATASET_LOOKBACK_DAYS = max(1, int(os.getenv("PM_DATASET_LOOKBACK_DAYS", "30")))
+DATASET_MAX_RANGE_DAYS = int(
+    os.getenv("PM_DATASET_MAX_RANGE_DAYS", str(DATASET_LOOKBACK_DAYS + 1))
+)
+# Where to ask for data beyond the public window (shown in the UI and API errors).
+OWNER_CONTACT = os.getenv("PM_OWNER_CONTACT", "https://polyscripts.world").strip()
 # Parallel parquet reads inside one dataset build (each archive file is one window).
 DATASET_READ_WORKERS = max(1, int(os.getenv("PM_DATASET_READ_WORKERS", "8")))
 # Dataset zip builds themselves; 1 keeps SQLite + disk sequential.
 DATASET_BUILD_WORKERS = max(1, int(os.getenv("PM_DATASET_BUILD_WORKERS", "1")))
 
-# Chainlink TWAP lookback via Polymarket RTDS (30 or 60). See:
+# Settlement rule: 5m and 15m crypto Up/Down markets resolve on the 60s
+# Chainlink TWAP (5m moved from 30s to 60s on 2026-08-14 00:00 UTC). This is a
+# market rule, not a tuning knob, so it is not configurable. See:
 # https://docs.polymarket.com/market-data/chainlink-twap
-# From 2026-08-14 00:00 UTC, 5m crypto markets also use 60s TWAP (same as 15m).
-TWAP_WINDOW_SEC = int(os.getenv("PM_TWAP_WINDOW", "60"))
-if TWAP_WINDOW_SEC not in (30, 60):
-    TWAP_WINDOW_SEC = 60
+TWAP_WINDOW_SEC = 60
 
 
 def twap_window_for_interval(interval: str) -> int:
-    """5m and 15m crypto markets both settle on 60s Chainlink TWAP."""
-    return 60
+    """TWAP lookback both crypto intervals settle on."""
+    return TWAP_WINDOW_SEC
+
+
+# --- Analytics -------------------------------------------------------------
+# Seconds-before-close checkpoints captured once per window into
+# window_snapshots; calibration, regime stats and the rule backtester query
+# these instead of re-reading every parquet archive. Checkpoints longer than a
+# window are skipped for that interval.
+SNAPSHOT_CHECKPOINTS_SEC = (840, 600, 480, 360, 300, 240, 180, 120, 90, 60, 45, 30, 20, 10, 5)
+# A checkpoint takes the last tick at or before end - t, within this tolerance.
+SNAPSHOT_TOLERANCE_SEC = 3
+# Order-book depth band: shares resting within this many cents of the best price.
+BOOK_DEPTH_BAND_CENTS = 2.0
+# Realized volatility lookback for the fair-value model (Chainlink 1s returns).
+FAIR_VOL_LOOKBACK_SEC = int(os.getenv("PM_FAIR_VOL_LOOKBACK_SEC", "900"))
+FAIR_VOL_MIN_SAMPLES = 30
+# Binance -> Chainlink lead/lag estimate: lookback and max lag tested.
+LEAD_LAG_LOOKBACK_SEC = int(os.getenv("PM_LEAD_LAG_LOOKBACK_SEC", "600"))
+LEAD_LAG_MAX_SEC = 10
+LEAD_LAG_REFRESH_SEC = 10.0
+# Re-ask Gamma for a published winner on windows whose outcome was inferred,
+# for this long after close (catches inferred-vs-official mismatches).
+RESOLUTION_RECHECK_HOURS = int(os.getenv("PM_RESOLUTION_RECHECK_HOURS", "24"))
+RESOLUTION_RECHECK_INTERVAL_SEC = 60
+
+# --- Alerts ----------------------------------------------------------------
+# Thresholds are in cents. Edge = fair value - ask on the cheaper side.
+ALERT_EDGE_CENTS = float(os.getenv("PM_ALERT_EDGE_CENTS", "10"))
+# Fire when YES ask + NO ask <= 100 - this (buying both sides locks a profit).
+ALERT_ARB_CENTS = float(os.getenv("PM_ALERT_ARB_CENTS", "1"))
+# Ignore edges with less time left than this (fills are unrealistic at the bell).
+ALERT_MIN_SECS_LEFT = int(os.getenv("PM_ALERT_MIN_SECS_LEFT", "5"))
+ALERT_COOLDOWN_SEC = int(os.getenv("PM_ALERT_COOLDOWN_SEC", "300"))
+# Market alerts need live inputs: a frozen book or spot produces phantom edges.
+# Quiet books are re-polled over REST every BOOK_POLL_INTERVAL_SEC once older
+# than CLOB_STALE_SEC, so twice that means both WS and REST have stalled.
+ALERT_MAX_QUOTE_AGE_SEC = 2 * CLOB_STALE_SEC
+ALERT_MAX_SPOT_AGE_SEC = 5
+ALERT_DISCORD_WEBHOOK = os.getenv("PM_ALERT_DISCORD_WEBHOOK", "").strip()
+ALERT_TELEGRAM_TOKEN = os.getenv("PM_ALERT_TELEGRAM_TOKEN", "").strip()
+ALERT_TELEGRAM_CHAT_ID = os.getenv("PM_ALERT_TELEGRAM_CHAT_ID", "").strip()
 
 
 @dataclass(frozen=True)
