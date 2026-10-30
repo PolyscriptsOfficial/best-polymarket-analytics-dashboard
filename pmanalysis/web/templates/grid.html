@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block title %}Grid — PolyScripts - Polymarket Analysis{% endblock %}
+{% block body %}
+{% include "partials/topbar.html" %}
+<div class="page-container">
+  <div class="history-head grid-head">
+    <h1>All markets</h1>
+    <div class="grid-head-right">
+      <span id="grid-lead" class="grid-lead" title="Chainlink lag behind Binance · return correlation · basis">—</span>
+      <button type="button" id="alerts-toggle" class="alerts-toggle" aria-pressed="false">Alerts: off</button>
+    </div>
+  </div>
+  <div id="market-grid" class="market-grid" aria-live="off"></div>
+</div>
+<div id="alert-stack" class="alert-stack" aria-live="polite"></div>
+<script>
+  window.PM_CONFIG = {
+    assets: {{ assets | tojson }},
+    intervals: {{ intervals | tojson }},
+    intervalSeconds: {{ interval_seconds | tojson }},
+  };
+</script>
+{% endblock %}
+{% block scripts %}
+<script src="/static/js/lib/format.js?v=term49"></script>
+<script src="/static/js/lib/ws.js?v=term44"></script>
+<script src="/static/js/lib/analytics.js?v=term1"></script>
+<script src="/static/js/grid.js?v=grid2"></script>
+{% endblock %}

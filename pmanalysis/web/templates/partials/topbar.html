@@ -1,5 +1,6 @@
 {% set path = request.url.path %}
 {% set on_terminal = path == '/' or path.startswith('/market/') %}
+{% set live_page = on_terminal or path == '/grid' %}
 <header class="topbar">
   <div class="topbar-left">
     <a
@@ -15,13 +16,10 @@
           PolyScripts
           <img class="brand-badge" src="/static/img/polymarket-badge.png?v=orig1" alt="Polymarket" title="Powered by Polymarket" width="14" height="14">
         </span>
-        <span class="brand-sub">
-          Polymarket Analysis
-          <span class="brand-version" aria-label="Version">v1.0</span>
-        </span>
+        <span class="brand-sub">Polymarket Analysis</span>
       </span>
     </a>
-    {% if on_terminal %}
+    {% if live_page %}
     <span id="ws-status" class="ws-badge ws-off">Connecting…</span>
     {% endif %}
   </div>
@@ -38,7 +36,9 @@
     >?</button>
     <nav class="topbar-nav" aria-label="Primary">
       <a href="/" class="{{ 'active' if on_terminal else '' }}">Terminal</a>
+      <a href="/grid" class="{{ 'active' if path == '/grid' else '' }}">Grid</a>
       <a href="/history" class="{{ 'active' if path == '/history' else '' }}">History</a>
+      <a href="/research" class="{{ 'active' if path == '/research' else '' }}">Research</a>
       <a href="/status" class="{{ 'active' if path == '/status' else '' }}">Status</a>
     </nav>
   </div>
