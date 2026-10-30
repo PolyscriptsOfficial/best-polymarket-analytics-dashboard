@@ -128,12 +128,20 @@ def count_reversals_tiered(
     return len(events), events
 
 
-def _ticks_from_frame(frame) -> list[tuple[int, float, float, int]]:
-    cols = ["ts_ms", "yes_ask", "no_ask", "secs_remaining"]
+def _with_secs(rows, end_ts: int) -> list[tuple[int, float, float, int]]:
+    """(ts_ms, yes_ask, no_ask) -> + seconds left (derived, not stored)."""
+    return [
+        (int(ts_ms), yes_ask, no_ask, max(0, end_ts - int(ts_ms) // 1000))
+        for ts_ms, yes_ask, no_ask in rows
+    ]
+
+
+def _ticks_from_frame(frame, end_ts: int) -> list[tuple[int, float, float, int]]:
+    cols = ["ts_ms", "yes_ask", "no_ask"]
     if frame is None or frame.empty or not set(cols).issubset(frame.columns):
         return []
     sub = frame[cols].dropna(subset=["ts_ms"]).sort_values("ts_ms")
-    return list(sub.itertuples(index=False, name=None))
+    return _with_secs(sub.itertuples(index=False, name=None), end_ts)
 
 
 def _load_ticks_for_window(
@@ -142,15 +150,15 @@ def _load_ticks_for_window(
     """SQLite first (live/recent windows); parquet archive fallback for windows
     whose ticks were pruned from SQLite by the retention job."""
     rows = (
-        session.query(Tick.ts_ms, Tick.yes_ask, Tick.no_ask, Tick.secs_remaining)
+        session.query(Tick.ts_ms, Tick.yes_ask, Tick.no_ask)
         .filter_by(window_id=window.id)
         .order_by(Tick.ts_ms)
         .all()
     )
     if rows:
-        return rows
+        return _with_secs(rows, window.end_ts)
     if window.archived:
-        return _ticks_from_frame(load_window_frame(window))
+        return _ticks_from_frame(load_window_frame(window), window.end_ts)
     return []
 
 
@@ -189,15 +197,15 @@ def load_btc_window_ticks(session: Session) -> list[LoadedWindow]:
                 Tick.ts_ms,
                 Tick.yes_ask,
                 Tick.no_ask,
-                Tick.secs_remaining,
             )
             .filter(Tick.window_id.in_(batch_ids))
             .order_by(Tick.window_id, Tick.ts_ms)
             .all()
         )
-        for window_id, ts_ms, yes_ask, no_ask, secs_remaining in tick_rows:
+        for window_id, ts_ms, yes_ask, no_ask in tick_rows:
+            end_ts = window_map[window_id].end_ts
             ticks_by_window.setdefault(window_id, []).append(
-                (ts_ms, yes_ask, no_ask, secs_remaining)
+                (ts_ms, yes_ask, no_ask, max(0, end_ts - ts_ms // 1000))
             )
 
     loaded: list[LoadedWindow] = []
@@ -205,7 +213,7 @@ def load_btc_window_ticks(session: Session) -> list[LoadedWindow]:
         ticks = ticks_by_window.get(window_id)
         window = window_map[window_id]
         if not ticks and window.archived:
-            ticks = _ticks_from_frame(load_window_frame(window))
+            ticks = _ticks_from_frame(load_window_frame(window), window.end_ts)
         if not ticks:
             continue
         loaded.append(
@@ -323,7 +331,6 @@ def _analyze_window_map(
                 Tick.ts_ms,
                 Tick.yes_ask,
                 Tick.no_ask,
-                Tick.secs_remaining,
             )
             .filter(Tick.window_id.in_(batch_ids))
             .order_by(Tick.window_id, Tick.ts_ms)
@@ -331,16 +338,17 @@ def _analyze_window_map(
         )
 
         ticks_by_window: dict[int, list[tuple[int, float, float, int]]] = {}
-        for window_id, ts_ms, yes_ask, no_ask, secs_remaining in tick_rows:
+        for window_id, ts_ms, yes_ask, no_ask in tick_rows:
+            end_ts = window_map[window_id].end_ts
             ticks_by_window.setdefault(window_id, []).append(
-                (ts_ms, yes_ask, no_ask, secs_remaining)
+                (ts_ms, yes_ask, no_ask, max(0, end_ts - ts_ms // 1000))
             )
 
         for window_id in batch_ids:
             ticks = ticks_by_window.get(window_id)
             window = window_map[window_id]
             if not ticks and window.archived:
-                ticks = _ticks_from_frame(load_window_frame(window))
+                ticks = _ticks_from_frame(load_window_frame(window), window.end_ts)
             if not ticks:
                 continue
             reversal_count, events = count_reversals(ticks, threshold=threshold)

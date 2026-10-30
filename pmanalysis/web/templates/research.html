@@ -1,0 +1,81 @@
+{% extends "base.html" %}
+{% block title %}Research — PolyScripts - Polymarket Analysis{% endblock %}
+{% block body %}
+{% include "partials/topbar.html" %}
+<div class="page-container research-page">
+  <div class="history-head">
+    <h1>Research</h1>
+    <p class="status-refresh-hint">From per-window checkpoints. Run <code>python -m pmanalysis backfill-features</code> once to include windows archived before this feature.</p>
+  </div>
+
+  <div class="filters research-filters" role="group" aria-label="Research filters">
+    <select id="rs-asset" aria-label="Asset">
+      {% for a in assets %}<option>{{ a }}</option>{% endfor %}
+    </select>
+    <select id="rs-interval" aria-label="Interval">
+      {% for i in intervals %}<option>{{ i }}</option>{% endfor %}
+    </select>
+    <select id="rs-days" aria-label="Period">
+      <option value="7">Last 7 days</option>
+      <option value="30" selected>Last 30 days</option>
+      <option value="90">Last 90 days</option>
+      <option value="366">Last year</option>
+    </select>
+    <select id="rs-tminus" aria-label="Checkpoint"></select>
+  </div>
+
+  <section class="research-section">
+    <div class="research-section-head">
+      <h2 class="status-section-title">Calibration · implied YES vs realized UP rate</h2>
+      <button type="button" class="btn-pager" id="cal-table-toggle" aria-pressed="false">Show table</button>
+    </div>
+    <p class="research-note" id="cal-summary">—</p>
+    <div class="research-chart" id="cal-chart" role="img" aria-label="Calibration chart"></div>
+    <div class="table-wrap research-table hidden" id="cal-table"></div>
+  </section>
+
+  <section class="research-section">
+    <h2 class="status-section-title">Regimes · UP win rate</h2>
+    <p class="research-note" id="reg-summary">—</p>
+    <div class="regime-grid">
+      <div class="status-card"><h3>By hour (ET)</h3><div id="reg-hour"></div></div>
+      <div class="status-card"><h3>After a streak</h3><div id="reg-streak"></div></div>
+      <div class="status-card"><h3>By realized volatility</h3><div id="reg-vol"></div></div>
+      <div class="status-card"><h3>By first-minute TWAP move</h3><div id="reg-move"></div></div>
+    </div>
+  </section>
+
+  <section class="research-section">
+    <h2 class="status-section-title">Rule backtest</h2>
+    <form id="bt-form" class="bt-form">
+      <label>Side
+        <select name="side">
+          <option value="AUTO">Follow TWAP diff</option>
+          <option value="YES">Always YES</option>
+          <option value="NO">Always NO</option>
+        </select>
+      </label>
+      <label>Min ask ¢<input name="min_ask" type="number" step="0.1" min="0" max="100" value="1"></label>
+      <label>Max ask ¢<input name="max_ask" type="number" step="0.1" min="0" max="100" value="95"></label>
+      <label title="TWAP diff in the chosen side's favour, in dollars">Min diff $<input name="min_diff" type="number" step="0.01" placeholder="any"></label>
+      <label title="Fair value minus ask, in cents">Min edge ¢<input name="min_edge" type="number" step="0.1" placeholder="any"></label>
+      <label>Shares<input name="shares" type="number" step="1" min="1" value="10"></label>
+      <label>Slippage ¢<input name="slippage_cents" type="number" step="0.1" min="0" value="0"></label>
+      <label title="Taker fee as a percent of notional">Fee %<input name="fee_pct" type="number" step="0.01" min="0" value="0"></label>
+      <label class="bt-check"><input name="require_size" type="checkbox"> Require ask size ≥ shares</label>
+      <button type="submit" class="slug-load-btn">Run</button>
+    </form>
+    <div class="bt-tiles" id="bt-tiles"></div>
+    <div class="research-chart research-chart-sm" id="bt-chart" role="img" aria-label="Equity curve"></div>
+    <div class="table-wrap research-table" id="bt-trades"></div>
+  </section>
+</div>
+<script>
+  window.PM_CONFIG = { checkpoints: {{ checkpoints | tojson }} };
+</script>
+{% endblock %}
+{% block scripts %}
+<script src="/static/js/lib/format.js?v=term49"></script>
+<script src="/static/js/lib/analytics.js?v=term1"></script>
+<script src="/static/js/research.js?v=rs3"></script>
+{% endblock %}
