@@ -4,11 +4,11 @@ from pmanalysis.db.models import (
     Candle,
     ClobQuote,
     CollectorGap,
-    Indicator,
     Market,
     OracleTick,
     Tick,
     Window,
+    WindowSnapshot,
 )
 from pmanalysis.db.clear import clear_database
 from pmanalysis.db.session import get_session, init_db
@@ -19,11 +19,11 @@ __all__ = [
     "Candle",
     "ClobQuote",
     "CollectorGap",
-    "Indicator",
     "Market",
     "OracleTick",
     "Tick",
     "Window",
+    "WindowSnapshot",
     "clear_database",
     "get_session",
     "init_db",

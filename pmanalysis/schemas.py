@@ -28,6 +28,17 @@ class MarketCard(BaseModel):
     lean: float | None
     twap_oracle: float | None = None
     twap_initial: float | None = None
+    # Fair-value model (cents) and edge = fair - ask for each side.
+    fair_yes: float | None = None
+    edge_yes: float | None = None
+    edge_no: float | None = None
+    sigma: float | None = None
+    # Order book (shares) and traded notional this window (USDC).
+    yes_ask_size: float | None = None
+    no_ask_size: float | None = None
+    yes_ask_depth: float | None = None
+    no_ask_depth: float | None = None
+    volume_usd: float | None = None
 
 
 class Snapshot(BaseModel):

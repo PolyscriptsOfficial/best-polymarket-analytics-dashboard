@@ -9,7 +9,8 @@ from sqlalchemy.orm import Session
 
 from pmanalysis.config import ASSETS, INTERVALS, FEED_RECORD_ENABLED
 from pmanalysis.collector.health import FEED_SOURCES, build_feed_row
-from pmanalysis.db.models import CollectorGap, Indicator, Tick, Window
+from pmanalysis.db.models import CollectorGap, Tick, Window
+from pmanalysis.db.tick_fields import STORED_TICK_COLUMNS, derive_tick_fields
 from pmanalysis.db.series import load_window_series, preview_points, tick_payload_points
 from pmanalysis.schemas import MarketCard, WindowSummary
 
@@ -98,14 +99,6 @@ def _dist_from_opening(current: float | None, opening: float | None) -> float | 
     return round(current - opening, 2)
 
 
-def latest_indicator(session: Session, window_id: int, ts_ms: int) -> Indicator | None:
-    return (
-        session.query(Indicator)
-        .filter_by(window_id=window_id, ts_ms=ts_ms)
-        .first()
-    )
-
-
 def build_market_cards(session: Session) -> list[MarketCard]:
     now_ts = _now_ts()
     cards: list[MarketCard] = []
@@ -116,22 +109,28 @@ def build_market_cards(session: Session) -> list[MarketCard]:
                 cards.append(_empty_card(asset, interval))
                 continue
             tick = latest_tick(session, window.id)
-            indicator = latest_indicator(session, window.id, tick.ts_ms) if tick else None
             opening = opening_oracle_price(session, window)
             oracle = tick.oracle_price if tick else None
-            twap = getattr(indicator, "twap_oracle", None) if indicator else None
-            # Prefer earliest stored TWAP in this window as Initial Price.
-            first_twap = (
-                session.query(Indicator.twap_oracle)
-                .filter(
-                    Indicator.window_id == window.id,
-                    Indicator.twap_oracle.isnot(None),
+            twap = tick.twap_oracle if tick else None
+            # Target = window-open TWAP; before it is persisted, the earliest TWAP stored.
+            twap_initial = window.twap_initial
+            if twap_initial is None:
+                first_twap = (
+                    session.query(Tick.twap_oracle)
+                    .filter(Tick.window_id == window.id, Tick.twap_oracle.isnot(None))
+                    .order_by(Tick.ts_ms.asc())
+                    .first()
                 )
-                .order_by(Indicator.ts_ms.asc())
-                .first()
-            )
-            twap_initial = (
-                float(first_twap[0]) if first_twap and first_twap[0] is not None else None
+                twap_initial = float(first_twap[0]) if first_twap else None
+            derived = (
+                derive_tick_fields(
+                    {name: getattr(tick, name) for name in ("ts_ms", *STORED_TICK_COLUMNS)},
+                    end_ts=window.end_ts,
+                    strike_price=window.strike_price,
+                    twap_initial=twap_initial,
+                )
+                if tick
+                else None
             )
             cards.append(
                 MarketCard(
@@ -139,23 +138,23 @@ def build_market_cards(session: Session) -> list[MarketCard]:
                     interval=interval,
                     slug=window.slug,
                     question=window.question,
-                    yes_mid=tick.yes_mid if tick else 0,
-                    no_mid=tick.no_mid if tick else 0,
+                    yes_mid=derived["yes_mid"] if derived else 0,
+                    no_mid=derived["no_mid"] if derived else 0,
                     yes_ask=tick.yes_ask if tick else 0,
                     no_ask=tick.no_ask if tick else 0,
-                    combined_ask=tick.combined_ask if tick else 0,
+                    combined_ask=derived["combined_ask"] if derived else 0,
                     oracle_price=oracle,
                     strike_price=window.strike_price,
                     opening_oracle_price=opening,
-                    dist_from_strike=tick.dist_from_strike if tick else None,
+                    dist_from_strike=derived["dist_from_strike"] if derived else None,
                     # Difference = current TWAP − initial TWAP.
                     dist_from_opening=_dist_from_opening(twap, twap_initial),
                     start_ts=window.start_ts,
                     end_ts=window.end_ts,
                     secs_remaining=max(0, window.end_ts - now_ts),
                     outcome=window.outcome,
-                    arb_edge=indicator.arb_edge if indicator else None,
-                    lean=indicator.lean if indicator else None,
+                    arb_edge=derived["arb_edge"] if derived else None,
+                    lean=derived["lean"] if derived else None,
                     twap_oracle=twap,
                     twap_initial=twap_initial,
                 )
@@ -271,7 +270,9 @@ def db_stats(session: Session) -> dict:
 
     return {
         "window_count": _approx_rows(Window),
-        "tick_count": _approx_rows(Tick),
+        # Exact: ticks only hold ~24h (retention), and COUNT uses ix_ticks_window_ts.
+        "tick_count": int(session.query(func.count(Tick.id)).scalar() or 0),
+        "ticks_written": _approx_rows(Tick),  # all-time, via MAX(id)
         "binance_trade_count": _approx_rows(BinanceTrade),
         "oracle_tick_count": _approx_rows(OracleTick),
         "clob_quote_count": _approx_rows(ClobQuote),
@@ -492,6 +493,8 @@ def window_ticks_payload(session: Session, slug: str) -> dict | None:
             "end_ts": window.end_ts,
             "strike_price": window.strike_price,
             "opening_oracle_price": opening_oracle_price(session, window),
+            "twap_initial": window.twap_initial,
+            "final_twap": window.final_twap,
             "outcome": window.outcome,
         },
         "ticks": tick_payload_points(rows),

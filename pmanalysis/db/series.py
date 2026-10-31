@@ -10,9 +10,11 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from pmanalysis.db.models import Indicator, Tick, Window
+from pmanalysis.db.models import Tick, Window
+from pmanalysis.db.tick_fields import with_derived
 from pmanalysis.export.parquet import load_window_frame
 
+# Chart payload keys: stored (prices, quotes, TWAP, fair) + derived (mids, YES+NO, gaps).
 _SERIES_KEYS = (
     "ts_ms",
     "oracle_price",
@@ -25,6 +27,19 @@ _SERIES_KEYS = (
     "dist_from_strike",
     "arb_edge",
     "twap_oracle",
+    "twap_diff",
+    "fair_yes",
+)
+# Stored columns the series needs (yes/no bids feed the derived mids).
+_STORED_KEYS = (
+    "oracle_price",
+    "binance_price",
+    "twap_oracle",
+    "yes_ask",
+    "yes_bid",
+    "no_ask",
+    "no_bid",
+    "fair_yes",
 )
 
 
@@ -59,38 +74,24 @@ def downsample_rows(rows: list[dict], max_points: int) -> list[dict]:
     return sampled
 
 
+def _series(window: Window, rows: list[dict]) -> list[dict]:
+    rows = with_derived(
+        rows,
+        end_ts=window.end_ts,
+        strike_price=window.strike_price,
+        twap_initial=window.twap_initial,
+    )
+    return [{key: row.get(key) for key in _SERIES_KEYS} for row in rows]
+
+
 def _rows_from_sqlite(session: Session, window: Window) -> list[dict]:
     ticks = (
-        session.query(Tick)
+        session.query(Tick.ts_ms, *(getattr(Tick, key) for key in _STORED_KEYS))
         .filter_by(window_id=window.id)
         .order_by(Tick.ts_ms)
         .all()
     )
-    if not ticks:
-        return []
-    indicators = {
-        row.ts_ms: row
-        for row in session.query(Indicator).filter_by(window_id=window.id).all()
-    }
-    rows: list[dict] = []
-    for tick in ticks:
-        indicator = indicators.get(tick.ts_ms)
-        rows.append(
-            {
-                "ts_ms": tick.ts_ms,
-                "oracle_price": tick.oracle_price,
-                "binance_price": tick.binance_price,
-                "yes_mid": tick.yes_mid,
-                "no_mid": tick.no_mid,
-                "yes_ask": tick.yes_ask,
-                "no_ask": tick.no_ask,
-                "combined_ask": tick.combined_ask,
-                "dist_from_strike": tick.dist_from_strike,
-                "arb_edge": indicator.arb_edge if indicator else None,
-                "twap_oracle": getattr(indicator, "twap_oracle", None) if indicator else None,
-            }
-        )
-    return rows
+    return _series(window, [dict(zip(("ts_ms", *_STORED_KEYS), tick)) for tick in ticks])
 
 
 def _rows_from_parquet(window: Window) -> list[dict]:
@@ -98,27 +99,17 @@ def _rows_from_parquet(window: Window) -> list[dict]:
     if frame is None or frame.empty:
         return []
     rows: list[dict] = []
-    for record in frame.to_dict(orient="records"):
+    # Old archives also carry derived columns; with_derived keeps those values.
+    keys = [k for k in dict.fromkeys((*_STORED_KEYS, *_SERIES_KEYS[1:])) if k in frame.columns]
+    for record in frame[["ts_ms", *keys]].to_dict(orient="records"):
         ts_ms = _int(record.get("ts_ms"))
         if ts_ms is None:
             continue
-        rows.append(
-            {
-                "ts_ms": ts_ms,
-                "oracle_price": _num(record.get("oracle_price")),
-                "binance_price": _num(record.get("binance_price")),
-                "yes_mid": _num(record.get("yes_mid")),
-                "no_mid": _num(record.get("no_mid")),
-                "yes_ask": _num(record.get("yes_ask")),
-                "no_ask": _num(record.get("no_ask")),
-                "combined_ask": _num(record.get("combined_ask")),
-                "dist_from_strike": _num(record.get("dist_from_strike")),
-                "arb_edge": _num(record.get("arb_edge")),
-                "twap_oracle": _num(record.get("twap_oracle")),
-            }
-        )
+        row = {key: _num(record.get(key)) for key in keys}
+        row["ts_ms"] = ts_ms
+        rows.append(row)
     rows.sort(key=lambda row: row["ts_ms"])
-    return rows
+    return _series(window, rows)
 
 
 def load_window_series(session: Session, window: Window) -> list[dict]:

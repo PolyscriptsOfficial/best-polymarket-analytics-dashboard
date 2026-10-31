@@ -58,6 +58,16 @@ class Window(Base):
     strike_source: Mapped[str | None] = mapped_column(String(32), nullable=True)
     outcome: Mapped[str | None] = mapped_column(String(8), nullable=True)
     final_oracle_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Settlement inputs: window-open 60s TWAP (the target) and the TWAP at close.
+    twap_initial: Mapped[float | None] = mapped_column(Float, nullable=True)
+    final_twap: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # "gamma" = official winner; "inferred" = our own final TWAP vs target.
+    outcome_source: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    inferred_outcome: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    outcome_mismatch: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Window features for regime stats (filled at finalize / backfill).
+    realized_vol: Mapped[float | None] = mapped_column(Float, nullable=True)
+    open_move: Mapped[float | None] = mapped_column(Float, nullable=True)
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     archived: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(
@@ -66,51 +76,80 @@ class Window(Base):
 
     market: Mapped[Market] = relationship(back_populates="windows")
     ticks: Mapped[list[Tick]] = relationship(back_populates="window", cascade="all, delete-orphan")
-    indicators: Mapped[list[Indicator]] = relationship(
-        back_populates="window", cascade="all, delete-orphan"
-    )
 
 
 class Tick(Base):
+    """One market second: only values observed live (plus the model's fair value).
+
+    Anything that is arithmetic on these columns (mids, spread, YES+NO,
+    seconds left, distance to strike, TWAP gap, ...) is derived on read by
+    ``db/tick_fields.py``, so it is never stored twice.
+    """
+
     __tablename__ = "ticks"
     __table_args__ = (Index("ix_ticks_window_ts", "window_id", "ts_ms"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     window_id: Mapped[int] = mapped_column(ForeignKey("windows.id"), nullable=False)
     ts_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # Feeds: Chainlink spot, Binance spot, Polymarket RTDS 60s Chainlink TWAP.
     oracle_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     binance_price: Mapped[float | None] = mapped_column(Float, nullable=True)
-    binance_perp_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    twap_oracle: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Best quotes in cents (0 = no quote).
     yes_ask: Mapped[float] = mapped_column(Float, default=0.0)
     yes_bid: Mapped[float] = mapped_column(Float, default=0.0)
     no_ask: Mapped[float] = mapped_column(Float, default=0.0)
     no_bid: Mapped[float] = mapped_column(Float, default=0.0)
-    yes_mid: Mapped[float] = mapped_column(Float, default=0.0)
-    no_mid: Mapped[float] = mapped_column(Float, default=0.0)
-    combined_ask: Mapped[float] = mapped_column(Float, default=0.0)
-    yes_spread: Mapped[float] = mapped_column(Float, default=0.0)
-    secs_remaining: Mapped[int] = mapped_column(Integer, default=0)
-    dist_from_strike: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Order book (shares): size at the best level and within the depth band.
+    yes_ask_size: Mapped[float | None] = mapped_column(Float, nullable=True)
+    yes_bid_size: Mapped[float | None] = mapped_column(Float, nullable=True)
+    no_ask_size: Mapped[float | None] = mapped_column(Float, nullable=True)
+    no_bid_size: Mapped[float | None] = mapped_column(Float, nullable=True)
+    yes_ask_depth: Mapped[float | None] = mapped_column(Float, nullable=True)
+    yes_bid_depth: Mapped[float | None] = mapped_column(Float, nullable=True)
+    no_ask_depth: Mapped[float | None] = mapped_column(Float, nullable=True)
+    no_bid_depth: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Trades: last fill price (cents) and USDC traded on YES+NO in this second.
+    yes_last_trade: Mapped[float | None] = mapped_column(Float, nullable=True)
+    no_last_trade: Mapped[float | None] = mapped_column(Float, nullable=True)
+    traded_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Fair-value model (analytics/fair_value.py), YES in cents. Stored because it
+    # depends on the 15 minutes of spot before this second.
+    fair_yes: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     window: Mapped[Window] = relationship(back_populates="ticks")
 
 
-class Indicator(Base):
-    __tablename__ = "indicators"
-    __table_args__ = (Index("ix_indicators_window_ts", "window_id", "ts_ms"),)
+class WindowSnapshot(Base):
+    """One row per window per seconds-before-close checkpoint.
+
+    Small and permanent (survives tick retention), so calibration, regime stats
+    and rule backtests are SQL over this table instead of parquet scans.
+    """
+
+    __tablename__ = "window_snapshots"
+    __table_args__ = (
+        UniqueConstraint("window_id", "t_minus", name="uq_window_snapshots_window_t"),
+        Index("ix_window_snapshots_market_t", "asset", "interval", "t_minus", "start_ts"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     window_id: Mapped[int] = mapped_column(ForeignKey("windows.id"), nullable=False)
-    ts_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    implied_yes_prob: Mapped[float] = mapped_column(Float, default=0.0)
-    arb_edge: Mapped[float] = mapped_column(Float, default=0.0)
-    lean: Mapped[float] = mapped_column(Float, default=0.0)
-    momentum_1m: Mapped[float | None] = mapped_column(Float, nullable=True)
-    volatility_5m: Mapped[float | None] = mapped_column(Float, nullable=True)
-    time_decay_factor: Mapped[float] = mapped_column(Float, default=0.0)
-    twap_oracle: Mapped[float | None] = mapped_column(Float, nullable=True)
-
-    window: Mapped[Window] = relationship(back_populates="indicators")
+    asset: Mapped[str] = mapped_column(String(8), nullable=False)
+    interval: Mapped[str] = mapped_column(String(8), nullable=False)
+    start_ts: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    t_minus: Mapped[int] = mapped_column(Integer, nullable=False)
+    yes_ask: Mapped[float | None] = mapped_column(Float, nullable=True)
+    yes_bid: Mapped[float | None] = mapped_column(Float, nullable=True)
+    no_ask: Mapped[float | None] = mapped_column(Float, nullable=True)
+    no_bid: Mapped[float | None] = mapped_column(Float, nullable=True)
+    yes_ask_size: Mapped[float | None] = mapped_column(Float, nullable=True)
+    no_ask_size: Mapped[float | None] = mapped_column(Float, nullable=True)
+    oracle_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    binance_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    twap_diff: Mapped[float | None] = mapped_column(Float, nullable=True)
+    fair_yes: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 
 class Candle(Base):
