@@ -24,7 +24,7 @@ def test_clear_database_keeps_markets(tmp_path, monkeypatch):
         )
         session.add(window)
         session.flush()
-        session.add(Tick(window_id=window.id, ts_ms=1_000_001_000, yes_mid=0.5, no_mid=0.5))
+        session.add(Tick(window_id=window.id, ts_ms=1_000_001_000))
 
     result = clear_database(include_archives=False)
     assert result["cleared"]["ticks"] == 1

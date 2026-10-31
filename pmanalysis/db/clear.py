@@ -13,10 +13,10 @@ from pmanalysis.db.models import (
     Candle,
     ClobQuote,
     CollectorGap,
-    Indicator,
     OracleTick,
     Tick,
     Window,
+    WindowSnapshot,
 )
 from pmanalysis.db.session import get_engine, get_session, init_db
 
@@ -49,10 +49,10 @@ def clear_database(*, include_archives: bool = True) -> dict:
     with get_session() as session:
         for model, name in (
             (Tick, "ticks"),
-            (Indicator, "indicators"),
             (BinanceTrade, "binance_trades"),
             (OracleTick, "oracle_ticks"),
             (ClobQuote, "clob_quotes"),
+            (WindowSnapshot, "window_snapshots"),
             (Window, "windows"),
             (Candle, "candles"),
             (CollectorGap, "collector_gaps"),

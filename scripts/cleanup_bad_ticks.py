@@ -16,7 +16,6 @@ def main() -> None:
     result = remove_impossible_quote_ticks()
     print("Removed impossible quote data:")
     print(f"  ticks:             {result['ticks_removed']}")
-    print(f"  indicators:        {result['indicators_removed']}")
     print(f"  windows affected:  {result['windows_affected']}")
 
 

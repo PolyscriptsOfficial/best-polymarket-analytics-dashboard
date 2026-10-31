@@ -7,11 +7,20 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from sqlalchemy import func, text, tuple_
+from sqlalchemy import func, text
 
 from pmanalysis.config import FEED_RECORD_ENABLED, TICK_RETENTION_HOURS
-from pmanalysis.db.models import BinanceTrade, ClobQuote, Indicator, OracleTick, Tick, Window
+from pmanalysis.db.models import (
+    BinanceTrade,
+    Candle,
+    ClobQuote,
+    OracleTick,
+    Tick,
+    Window,
+    WindowSnapshot,
+)
 from pmanalysis.db.session import get_engine, get_session, reset_engine
+from pmanalysis.export.parquet import archive_path_for
 
 log = logging.getLogger(__name__)
 
@@ -27,21 +36,11 @@ def remove_impossible_quote_ticks(*, ask_threshold: float = 90.0) -> dict:
             .all()
         )
         if not bad_rows:
-            return {
-                "ticks_removed": 0,
-                "indicators_removed": 0,
-                "windows_affected": 0,
-            }
+            return {"ticks_removed": 0, "windows_affected": 0}
 
         tick_ids = [row[0] for row in bad_rows]
-        pairs = list({(row[1], row[2]) for row in bad_rows})
         windows_affected = len({row[1] for row in bad_rows})
 
-        indicators_removed = (
-            session.query(Indicator)
-            .filter(tuple_(Indicator.window_id, Indicator.ts_ms).in_(pairs))
-            .delete(synchronize_session=False)
-        )
         ticks_removed = (
             session.query(Tick)
             .filter(Tick.id.in_(tick_ids))
@@ -49,67 +48,68 @@ def remove_impossible_quote_ticks(*, ask_threshold: float = 90.0) -> dict:
         )
         session.commit()
 
-    return {
-        "ticks_removed": ticks_removed,
-        "indicators_removed": indicators_removed,
-        "windows_affected": windows_affected,
-    }
+    return {"ticks_removed": ticks_removed, "windows_affected": windows_affected}
 
 
-def purge_archived_ticks(*, retention_hours: int | None = None, batch_size: int = 25) -> dict:
-    """Delete Tick/Indicator rows for windows already archived to parquet.
+def purge_archived_ticks(
+    *,
+    retention_hours: int | None = None,
+    batch_size: int = 250,
+) -> dict:
+    """Delete tick rows for archived windows past retention.
 
-    Only windows that are (a) marked archived=True (parquet file written by
-    export_window_parquet) and (b) resolved more than `retention_hours` ago are
-    touched. The windows catalog is kept. Deletes run in small batches so the
-    live collector is not locked for long.
+    Only windows that still have rows in ``ticks`` are considered, so sweeps stay
+    fast after history grows (no rescanning tens of thousands of empty catalog ids).
     """
     hours = TICK_RETENTION_HOURS if retention_hours is None else retention_hours
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
     with get_session() as session:
         window_ids = [
-            row[0]
-            for row in session.query(Window.id)
+            int(row[0])
+            for row in session.query(Tick.window_id)
+            .join(Window, Window.id == Tick.window_id)
             .filter(Window.archived.is_(True), Window.resolved_at < cutoff)
+            .distinct()
+            .order_by(Tick.window_id.asc())
             .all()
         ]
 
+    if not window_ids:
+        return {
+            "ticks_removed": 0,
+            "windows_affected": 0,
+            "retention_hours": hours,
+            "candidates": 0,
+        }
+
     ticks_removed = 0
-    indicators_removed = 0
     windows_affected = 0
     for offset in range(0, len(window_ids), batch_size):
         batch = window_ids[offset : offset + batch_size]
         with get_session() as session:
-            n_ind = (
-                session.query(Indicator)
-                .filter(Indicator.window_id.in_(batch))
-                .delete(synchronize_session=False)
-            )
             n_tick = (
                 session.query(Tick)
                 .filter(Tick.window_id.in_(batch))
                 .delete(synchronize_session=False)
             )
             session.commit()
-        indicators_removed += n_ind
         ticks_removed += n_tick
-        if n_tick or n_ind:
+        if n_tick:
             windows_affected += len(batch)
 
-    if ticks_removed or indicators_removed:
+    if ticks_removed:
         log.info(
-            "Retention purge: %d ticks, %d indicators removed across %d windows (archived, >%dh old)",
+            "Retention purge: %d ticks removed across %d windows (archived, >%dh old)",
             ticks_removed,
-            indicators_removed,
             windows_affected,
             hours,
         )
 
     return {
         "ticks_removed": ticks_removed,
-        "indicators_removed": indicators_removed,
         "windows_affected": windows_affected,
         "retention_hours": hours,
+        "candidates": len(window_ids),
     }
 
 
@@ -171,11 +171,182 @@ def vacuum_db() -> None:
         conn.execute(text("VACUUM"))
 
 
+def _window_row_from_db(row) -> "WindowRow":
+    from pmanalysis.datasets.schema import WindowRow
+
+    outcome = row.outcome
+    if outcome == "":
+        outcome = None
+    return WindowRow(
+        window_id=int(row.id),
+        slug=str(row.slug),
+        asset=str(row.asset).upper(),
+        interval=str(row.interval),
+        start_ts=int(row.start_ts),
+        end_ts=int(row.end_ts),
+        strike_price=float(row.strike_price) if row.strike_price is not None else None,
+        opening_oracle_price=(
+            float(row.opening_oracle_price) if row.opening_oracle_price is not None else None
+        ),
+        final_oracle_price=(
+            float(row.final_oracle_price) if row.final_oracle_price is not None else None
+        ),
+        outcome=str(outcome) if outcome is not None else None,
+        archived=bool(row.archived),
+    )
+
+
+def _broken_window_reason(window: "WindowRow", ts_ms, *, strict: bool) -> str | None:
+    from pmanalysis.datasets.completeness import evaluate_completeness
+
+    if not window.outcome:
+        return "unresolved"
+    if ts_ms is None or len(ts_ms) == 0:
+        return "no_ticks"
+    if not strict:
+        return None
+    comp = evaluate_completeness(
+        ts_ms,
+        start_ts=window.start_ts,
+        end_ts=window.end_ts,
+        interval=window.interval,
+    )
+    if not comp.complete:
+        return "incomplete"
+    return None
+
+
+def purge_broken_windows(*, dry_run: bool = False, batch_size: int = 250, strict: bool = False) -> dict:
+    """Delete closed windows that are not usable for backtests.
+
+    Default (``strict=False``): missing outcome, or no tick rows in SQLite/parquet.
+    ``strict=True`` also drops windows that fail dataset ``complete`` rules
+    (95% fill, 3s edges, 5s max gap) — can remove most history if feeds were gappy.
+
+    Removes SQLite ticks, the window catalog row, its candle, and parquet archive.
+    Stop the collector first so it does not recreate deleted slugs mid-pass.
+    """
+    from pmanalysis.datasets.schema import SQLITE_TICK_BATCH
+    from pmanalysis.datasets.ticks import load_window_tables
+
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    reasons: dict[str, int] = {}
+    to_remove: list[tuple[int, str, str, str, int]] = []
+
+    with get_session() as session:
+        closed = (
+            session.query(Window)
+            .filter(Window.end_ts < now_ts)
+            .order_by(Window.id.asc())
+            .all()
+        )
+        for offset in range(0, len(closed), batch_size):
+            chunk = closed[offset : offset + batch_size]
+            rows = [_window_row_from_db(window) for window in chunk]
+            tables = load_window_tables(session, rows)
+            for window in rows:
+                if window.archived:
+                    path = archive_path_for(window.asset, window.interval, window.slug)
+                    if not path.exists():
+                        reasons["missing_archive"] = reasons.get("missing_archive", 0) + 1
+                        to_remove.append(
+                            (
+                                window.window_id,
+                                window.slug,
+                                window.asset,
+                                window.interval,
+                                window.start_ts,
+                            )
+                        )
+                        continue
+                table = tables.get(window.window_id)
+                ts_ms = (
+                    table.column("ts_ms").to_numpy()
+                    if table is not None and table.num_rows
+                    else []
+                )
+                reason = _broken_window_reason(window, ts_ms, strict=strict)
+                if reason is None:
+                    continue
+                reasons[reason] = reasons.get(reason, 0) + 1
+                to_remove.append(
+                    (window.window_id, window.slug, window.asset, window.interval, window.start_ts)
+                )
+
+    if dry_run or not to_remove:
+        return {
+            "dry_run": dry_run,
+            "strict": strict,
+            "windows_removed": 0,
+            "parquet_removed": 0,
+            "candles_removed": 0,
+            "ticks_removed": 0,
+            "reasons": reasons,
+            "candidates": len(to_remove),
+        }
+
+    ticks_removed = 0
+    candles_removed = 0
+    parquet_removed = 0
+    windows_removed = 0
+
+    for offset in range(0, len(to_remove), SQLITE_TICK_BATCH):
+        batch = to_remove[offset : offset + SQLITE_TICK_BATCH]
+        batch_ids = [item[0] for item in batch]
+        with get_session() as session:
+            ticks_removed += (
+                session.query(Tick)
+                .filter(Tick.window_id.in_(batch_ids))
+                .delete(synchronize_session=False)
+            )
+            session.query(WindowSnapshot).filter(
+                WindowSnapshot.window_id.in_(batch_ids)
+            ).delete(synchronize_session=False)
+            for window_id, slug, asset, interval, start_ts in batch:
+                candles_removed += (
+                    session.query(Candle)
+                    .filter_by(asset=asset, interval=interval, ts=start_ts)
+                    .delete(synchronize_session=False)
+                )
+                path = archive_path_for(asset, interval, slug)
+                if path.exists():
+                    path.unlink()
+                    parquet_removed += 1
+            windows_removed += (
+                session.query(Window)
+                .filter(Window.id.in_(batch_ids))
+                .delete(synchronize_session=False)
+            )
+            session.commit()
+
+    log.info(
+        "Purged broken windows: %d removed (%s)",
+        windows_removed,
+        ", ".join(f"{k}={v}" for k, v in sorted(reasons.items()) if v),
+    )
+    checkpoint_wal()
+    from pmanalysis.datasets.query import clear_archive_fingerprint_cache
+
+    clear_archive_fingerprint_cache()
+
+    return {
+        "dry_run": False,
+        "strict": strict,
+        "windows_removed": windows_removed,
+        "parquet_removed": parquet_removed,
+        "candles_removed": candles_removed,
+        "ticks_removed": ticks_removed,
+        "reasons": reasons,
+        "candidates": len(to_remove),
+    }
+
+
 def run_retention(*, rebuild_raw: bool = False) -> dict:
     """One retention pass: prune archived ticks, raw feeds, then checkpoint WAL."""
     ticks = purge_archived_ticks()
     feeds = purge_raw_feeds(rebuild=rebuild_raw)
-    checkpoint_wal()
+    if ticks.get("ticks_removed"):
+        checkpoint_wal()
     from pmanalysis.datasets.query import clear_archive_fingerprint_cache
 
     clear_archive_fingerprint_cache()
@@ -204,8 +375,10 @@ def _keep_window_ids(conn: sqlite3.Connection, cutoff: datetime) -> list[int]:
     return keep
 
 
-_KEEP_FULL = ("markets", "windows", "candles", "collector_gaps")
-_KEEP_FILTERED = ("ticks", "indicators")
+# Small catalog / research tables, copied whole. Anything not listed here or in
+# _KEEP_FILTERED is discarded by compaction (that is how raw feeds are dropped).
+_KEEP_FULL = ("markets", "windows", "candles", "collector_gaps", "window_snapshots")
+_KEEP_FILTERED = ("ticks",)
 
 
 def _create_attached_table(conn: sqlite3.Connection, table: str) -> bool:
@@ -242,12 +415,21 @@ def _copy_indexes(conn: sqlite3.Connection, table: str) -> None:
         if on_at < 0:
             continue
         head = sql[:on_at].rstrip()
-        tail = sql[on_at + 4 :].lstrip()
-        idx_name = head.split()[-1].strip("\"'`[]")
-        try:
-            conn.execute(f'CREATE INDEX IF NOT EXISTS "{idx_name}_c" ON compact.{table} {tail}')
-        except sqlite3.Error:
+        cols_at = sql.find("(", on_at)
+        if cols_at < 0:
             continue
+        tail = sql[cols_at:]  # "(col, ...) [WHERE ...]" without the table name
+        idx_name = head.split()[-1].strip("\"'`[]")
+        unique = "UNIQUE " if head.lower().startswith("create unique") else ""
+        # SQLite puts the schema on the index name, never on the table:
+        # "ON compact.<table>" is a syntax error, which used to drop every index.
+        # Names are per database file, so the originals survive the swap.
+        try:
+            conn.execute(
+                f'CREATE {unique}INDEX IF NOT EXISTS compact."{idx_name}" ON "{table}" {tail}'
+            )
+        except sqlite3.Error as exc:
+            log.warning("compact: could not copy index %s: %s", idx_name, exc)
 
 
 def compact_live_db() -> dict:
@@ -267,6 +449,9 @@ def compact_live_db() -> dict:
     bak = src.with_name(src.name + ".old")
     cutoff = datetime.now(timezone.utc) - timedelta(hours=TICK_RETENTION_HOURS)
 
+    # Migrate first (slim ticks, indicators folded in): the copy below keeps
+    # only listed tables, so an un-migrated indicators table would be lost.
+    db_session.init_db()
     reset_engine()
     for leftover in (dst, Path(str(dst) + "-wal"), Path(str(dst) + "-shm")):
         leftover.unlink(missing_ok=True)
@@ -296,13 +481,6 @@ def compact_live_db() -> dict:
             INSERT INTO compact.ticks
             SELECT t.* FROM main.ticks AS t
             WHERE t.window_id IN (SELECT id FROM keep_windows)
-            """
-        )
-        conn.execute(
-            """
-            INSERT INTO compact.indicators
-            SELECT i.* FROM main.indicators AS i
-            WHERE i.window_id IN (SELECT id FROM keep_windows)
             """
         )
         for table in _KEEP_FULL + _KEEP_FILTERED:
