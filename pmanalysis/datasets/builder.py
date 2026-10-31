@@ -73,7 +73,10 @@ def _window_table(rows: list[dict]) -> pa.Table:
         "strike_price": [row["strike_price"] for row in rows],
         "opening_oracle_price": [row["opening_oracle_price"] for row in rows],
         "final_oracle_price": [row["final_oracle_price"] for row in rows],
+        "twap_initial": [row["twap_initial"] for row in rows],
+        "final_twap": [row["final_twap"] for row in rows],
         "outcome": [row["outcome"] for row in rows],
+        "outcome_source": [row["outcome_source"] for row in rows],
         "tick_count": [row["tick_count"] for row in rows],
         "complete": [row["complete"] for row in rows],
     }
@@ -166,7 +169,10 @@ def build_dataset_zip(
                         "strike_price": window.strike_price,
                         "opening_oracle_price": window.opening_oracle_price,
                         "final_oracle_price": window.final_oracle_price,
+                        "twap_initial": window.twap_initial,
+                        "final_twap": window.final_twap,
                         "outcome": window.outcome,
+                        "outcome_source": window.outcome_source,
                         "tick_count": verdict.tick_count,
                         "complete": verdict.complete,
                     }

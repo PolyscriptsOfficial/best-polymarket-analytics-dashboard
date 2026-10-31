@@ -5,8 +5,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
+import pytest
 from fastapi.testclient import TestClient
 
+from pmanalysis import config
 from pmanalysis.datasets.builder import build_dataset_zip
 from pmanalysis.datasets.client import DatasetClientError, fetch_dataset, load_dataset_zip
 from pmanalysis.datasets.completeness import evaluate_completeness
@@ -24,6 +26,13 @@ from pmanalysis.web.app import create_app
 PERIOD_START = datetime(2024, 1, 1, tzinfo=timezone.utc)
 PERIOD_END = datetime(2024, 1, 2, tzinfo=timezone.utc)
 WINDOW_START = int(datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc).timestamp())
+
+
+@pytest.fixture(autouse=True)
+def _historic_fixtures_allowed(monkeypatch):
+    """Fixtures are dated 2024; the public 30-day window is tested separately."""
+    monkeypatch.setattr(config, "DATASET_LOOKBACK_DAYS", 100_000)
+    monkeypatch.setattr(config, "DATASET_MAX_RANGE_DAYS", 366)
 
 
 def _isolate(tmp_path: Path, monkeypatch) -> Path:
@@ -96,18 +105,12 @@ def _add_window(
                 Tick(
                     window_id=window.id,
                     ts_ms=(start_ts + i) * 1000,
-                    secs_remaining=max(length - i, 0),
                     oracle_price=100.0,
                     binance_price=100.1,
                     yes_bid=yes_ask - 1,
                     yes_ask=yes_ask,
                     no_bid=9.0,
                     no_ask=10.0,
-                    yes_mid=0.895,
-                    no_mid=0.095,
-                    combined_ask=yes_ask + 10.0,
-                    yes_spread=1.0,
-                    dist_from_strike=0.0,
                 )
             )
     return window
@@ -678,7 +681,7 @@ def test_fetch_dataset_retries_after_404(tmp_path, monkeypatch):
     monkeypatch.setattr(client_mod.time, "sleep", lambda s: slept.append(s))
     dest = tmp_path / "out.zip"
     path = fetch_dataset(
-        base_url="http://collector:8000",
+        base_url="http://collector:8420",
         start="2024-01-01T00:00:00Z",
         end="2024-01-02T00:00:00Z",
         assets=["BTC"],
@@ -691,3 +694,73 @@ def test_fetch_dataset_retries_after_404(tmp_path, monkeypatch):
     assert dest.read_bytes() == b"zip-bytes"
     assert slept
     assert slept[0] == 0.25
+
+
+def test_public_download_window_is_last_30_days(monkeypatch):
+    monkeypatch.setattr(config, "DATASET_LOOKBACK_DAYS", 30)
+    monkeypatch.setattr(config, "DATASET_MAX_RANGE_DAYS", 31)
+    monkeypatch.setattr(config, "OWNER_CONTACT", "https://example.test/contact")
+    now = datetime(2026, 10, 31, 15, 0, tzinfo=timezone.utc)
+    now_ts = int(now.timestamp())
+    ok = parse_spec(
+        start=datetime(2026, 10, 1, tzinfo=timezone.utc),  # midnight 30 days back
+        end=now,
+        assets=["BTC"],
+        intervals=["5m"],
+        now_ts=now_ts,
+    )
+    assert ok.start == datetime(2026, 10, 1, tzinfo=timezone.utc)
+    with pytest.raises(SpecError, match="last 30 days.*example.test/contact"):
+        parse_spec(
+            start=datetime(2026, 9, 30, 23, tzinfo=timezone.utc),
+            end=datetime(2026, 10, 2, tzinfo=timezone.utc),
+            assets=["BTC"],
+            intervals=["5m"],
+            now_ts=now_ts,
+        )
+    with pytest.raises(SpecError, match="cannot exceed 31 days"):
+        parse_spec(
+            start=datetime(2026, 10, 1, tzinfo=timezone.utc),
+            end=datetime(2026, 11, 2, 1, tzinfo=timezone.utc),
+            assets=["BTC"],
+            intervals=["5m"],
+            now_ts=now_ts,
+        )
+
+
+def test_api_rejects_old_range_with_contact(tmp_path, monkeypatch):
+    _isolate(tmp_path, monkeypatch)
+    monkeypatch.setattr(config, "DATASET_LOOKBACK_DAYS", 30)
+    with TestClient(create_app()) as client:
+        response = client.post(
+            "/v1/datasets",
+            json={
+                "start": "2024-01-01T00:00:00Z",
+                "end": "2024-01-02T00:00:00Z",
+                "assets": ["BTC"],
+                "intervals": ["5m"],
+            },
+        )
+    assert response.status_code == 400
+    assert "last 30 days" in response.json()["detail"]
+    assert config.OWNER_CONTACT in response.json()["detail"]
+
+
+def test_csv_export_follows_public_window(tmp_path, monkeypatch):
+    _isolate(tmp_path, monkeypatch)
+    monkeypatch.setattr(config, "EXPORT_DIR", tmp_path / "exports")
+    with get_session() as session:
+        old_id = _add_window(session, n_ticks=5).id  # dated 2024
+        session.commit()
+    monkeypatch.setattr(config, "DATASET_LOOKBACK_DAYS", 30)
+    with TestClient(create_app()) as client:
+        response = client.get(f"/api/export/{old_id}?format=csv")
+    assert response.status_code == 403
+    assert "last 30 days" in response.json()["detail"]
+
+    monkeypatch.setattr(config, "DATASET_LOOKBACK_DAYS", 100_000)
+    with TestClient(create_app()) as client:
+        response = client.get(f"/api/export/{old_id}?format=csv")
+    assert response.status_code == 200
+    header = response.text.splitlines()[0].split(",")
+    assert {"yes_mid", "secs_remaining", "combined_ask"} <= set(header)  # derived on export

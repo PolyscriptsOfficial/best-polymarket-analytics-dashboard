@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
-from pmanalysis.datasets.schema import SpecError, canonical_assets, canonical_intervals, parse_spec
+from pmanalysis import config
+from pmanalysis.datasets.schema import (
+    SpecError,
+    canonical_assets,
+    canonical_intervals,
+    lookback_start,
+    parse_spec,
+)
 from pmanalysis.datasets.service import DatasetService
 from pmanalysis.db.session import run_db
 
@@ -28,6 +35,25 @@ def _service(request: Request) -> DatasetService:
     if service is None:
         raise HTTPException(status_code=503, detail="Dataset service is not running")
     return service
+
+
+def download_limits(now: datetime | None = None) -> dict:
+    """Public download window (shared by the History download panel)."""
+    now = now or datetime.now(timezone.utc)
+    return {
+        "lookback_days": config.DATASET_LOOKBACK_DAYS,
+        "max_range_days": config.DATASET_MAX_RANGE_DAYS,
+        "earliest_start": lookback_start(now).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "assets": list(config.ASSETS),
+        "intervals": list(config.INTERVALS),
+        "contact": config.OWNER_CONTACT,
+    }
+
+
+@router.get("/limits")
+async def api_limits():
+    """What can be downloaded without asking: requests outside this get HTTP 400."""
+    return download_limits()
 
 
 @router.get("/coverage")

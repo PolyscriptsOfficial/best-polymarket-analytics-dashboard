@@ -12,27 +12,41 @@ from sqlalchemy.orm import Session
 
 from pmanalysis import config
 from pmanalysis.datasets.schema import SQLITE_TICK_BATCH, TICK_SCHEMA, WindowRow, empty_table
-from pmanalysis.db.models import Indicator, Tick
+from pmanalysis.db.models import Tick
+from pmanalysis.db.tick_fields import STORED_TICK_COLUMNS, with_derived
 from pmanalysis.export.parquet import archive_path_for
 
-log = logging.getLogger(__name__)
-
+# Optional columns added in contract revision 2 (null for older windows).
+NEW_TICK_FIELDS = (
+    "twap_diff",
+    "fair_yes",
+    "yes_ask_size",
+    "yes_bid_size",
+    "no_ask_size",
+    "no_bid_size",
+    "yes_ask_depth",
+    "yes_bid_depth",
+    "no_ask_depth",
+    "no_bid_depth",
+    "yes_last_trade",
+    "no_last_trade",
+    "traded_usd",
+)
+# Everything a dataset row can be built from: stored columns, plus the derived
+# copies that archives written before the slim tick layout still carry.
 _ARCHIVE_OPTIONAL = {
     "ts_ms",
+    *STORED_TICK_COLUMNS,
     "secs_remaining",
-    "oracle_price",
-    "binance_price",
-    "twap_oracle",
-    "yes_bid",
-    "yes_ask",
-    "no_bid",
-    "no_ask",
     "yes_mid",
     "no_mid",
     "combined_ask",
     "yes_spread",
     "dist_from_strike",
+    "twap_diff",
 }
+
+log = logging.getLogger(__name__)
 
 
 def mid_to_cents(value: float | None) -> float | None:
@@ -68,12 +82,18 @@ def _int(value: Any, default: int = 0) -> int:
         return default
 
 
-def table_from_rows(window_id: int, rows: list[dict[str, Any]]) -> pa.Table:
+def table_from_rows(window: WindowRow, rows: list[dict[str, Any]]) -> pa.Table:
+    """Contract tick table for one window; derived columns are computed here."""
     if not rows:
-        table = empty_table(TICK_SCHEMA)
-        return table
+        return empty_table(TICK_SCHEMA)
+    rows = with_derived(
+        rows,
+        end_ts=window.end_ts,
+        strike_price=window.strike_price,
+        twap_initial=window.twap_initial,
+    )
     payload = {
-        "window_id": [window_id] * len(rows),
+        "window_id": [window.window_id] * len(rows),
         "ts_ms": [_int(row.get("ts_ms")) for row in rows],
         "secs_remaining": [_int(row.get("secs_remaining")) for row in rows],
         "oracle_price": [_num(row.get("oracle_price")) for row in rows],
@@ -88,6 +108,7 @@ def table_from_rows(window_id: int, rows: list[dict[str, Any]]) -> pa.Table:
         "combined_ask": [_num(row.get("combined_ask")) or 0.0 for row in rows],
         "yes_spread": [_num(row.get("yes_spread")) or 0.0 for row in rows],
         "dist_from_strike": [_num(row.get("dist_from_strike")) for row in rows],
+        **{name: [_num(row.get(name)) for row in rows] for name in NEW_TICK_FIELDS},
     }
     return pa.Table.from_pydict(payload, schema=TICK_SCHEMA)
 
@@ -119,7 +140,7 @@ def _read_archive(window: WindowRow) -> pa.Table:
     except Exception:
         log.warning("corrupt archive %s slug=%s", path, window.slug, exc_info=True)
         return empty_table(TICK_SCHEMA)
-    return table_from_rows(window.window_id, _archive_to_rows(window, table))
+    return table_from_rows(window, _archive_to_rows(window, table))
 
 
 def load_archive_tables(windows: list[WindowRow]) -> dict[int, pa.Table]:
@@ -145,67 +166,21 @@ def load_sqlite_tables(session: Session, windows: list[WindowRow]) -> dict[int, 
         return {}
     window_ids = [window.window_id for window in windows]
     ticks_by_window: dict[int, list[dict[str, Any]]] = {wid: [] for wid in window_ids}
-    twap_by_key: dict[tuple[int, int], float] = {}
+    names = ("ts_ms", *STORED_TICK_COLUMNS)
+    tick_cols = [getattr(Tick, name) for name in names]
 
     for offset in range(0, len(window_ids), SQLITE_TICK_BATCH):
         batch = window_ids[offset : offset + SQLITE_TICK_BATCH]
-        twap_rows = (
-            session.query(Indicator.window_id, Indicator.ts_ms, Indicator.twap_oracle)
-            .filter(Indicator.window_id.in_(batch))
-            .all()
-        )
-        for window_id, ts_ms, twap in twap_rows:
-            number = _num(twap)
-            if number is not None:
-                twap_by_key[(int(window_id), int(ts_ms))] = number
-
-        tick_rows = (
-            session.query(
-                Tick.window_id,
-                Tick.ts_ms,
-                Tick.secs_remaining,
-                Tick.oracle_price,
-                Tick.binance_price,
-                Tick.yes_bid,
-                Tick.yes_ask,
-                Tick.no_bid,
-                Tick.no_ask,
-                Tick.yes_mid,
-                Tick.no_mid,
-                Tick.combined_ask,
-                Tick.yes_spread,
-                Tick.dist_from_strike,
-            )
+        for window_id, *values in (
+            session.query(Tick.window_id, *tick_cols)
             .filter(Tick.window_id.in_(batch))
             .order_by(Tick.window_id, Tick.ts_ms)
             .all()
-        )
-        for row in tick_rows:
-            window_id = int(row[0])
-            ts_ms = int(row[1])
-            ticks_by_window.setdefault(window_id, []).append(
-                {
-                    "ts_ms": ts_ms,
-                    "secs_remaining": row[2],
-                    "oracle_price": row[3],
-                    "binance_price": row[4],
-                    "twap_oracle": twap_by_key.get((window_id, ts_ms)),
-                    "yes_bid": row[5],
-                    "yes_ask": row[6],
-                    "no_bid": row[7],
-                    "no_ask": row[8],
-                    "yes_mid": row[9],
-                    "no_mid": row[10],
-                    "combined_ask": row[11],
-                    "yes_spread": row[12],
-                    "dist_from_strike": row[13],
-                }
-            )
+        ):
+            ticks_by_window.setdefault(int(window_id), []).append(dict(zip(names, values)))
 
     return {
-        window.window_id: table_from_rows(
-            window.window_id, ticks_by_window.get(window.window_id, [])
-        )
+        window.window_id: table_from_rows(window, ticks_by_window.get(window.window_id, []))
         for window in windows
     }
 

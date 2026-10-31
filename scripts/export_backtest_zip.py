@@ -24,21 +24,19 @@ END_EXCLUSIVE = datetime(2026, 8, 21, tzinfo=timezone.utc)
 START_TS = int(START.timestamp())
 END_TS = int(END_EXCLUSIVE.timestamp())
 BATCH_WINDOWS = 250
+# Stored tick columns (mids, spread, YES+NO, seconds left are derivable;
+# see pmanalysis/db/tick_fields.py).
 TICK_COLS = [
     "window_id",
     "ts_ms",
     "oracle_price",
     "binance_price",
+    "twap_oracle",
     "yes_ask",
     "yes_bid",
     "no_ask",
     "no_bid",
-    "yes_mid",
-    "no_mid",
-    "combined_ask",
-    "yes_spread",
-    "secs_remaining",
-    "dist_from_strike",
+    "fair_yes",
 ]
 
 

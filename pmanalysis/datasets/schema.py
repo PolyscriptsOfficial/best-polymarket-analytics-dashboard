@@ -10,6 +10,9 @@ import pyarrow as pa
 from pmanalysis import config
 
 SCHEMA_VERSION = 1
+# Bumped for additive columns. Old clients only check SCHEMA_VERSION and ignore
+# unknown parquet columns; the revision keeps cached zips from predating them.
+CONTRACT_REVISION = 2
 PRICE_UNIT = "cents"
 TIME_UNIT = "unix"
 
@@ -29,7 +32,10 @@ WINDOW_FIELDS = (
     "strike_price",
     "opening_oracle_price",
     "final_oracle_price",
+    "twap_initial",
+    "final_twap",
     "outcome",
+    "outcome_source",
     "tick_count",
     "complete",
 )
@@ -50,6 +56,19 @@ TICK_FIELDS = (
     "combined_ask",
     "yes_spread",
     "dist_from_strike",
+    "twap_diff",
+    "fair_yes",
+    "yes_ask_size",
+    "yes_bid_size",
+    "no_ask_size",
+    "no_bid_size",
+    "yes_ask_depth",
+    "yes_bid_depth",
+    "no_ask_depth",
+    "no_bid_depth",
+    "yes_last_trade",
+    "no_last_trade",
+    "traded_usd",
 )
 
 WINDOW_SCHEMA = pa.schema(
@@ -63,7 +82,10 @@ WINDOW_SCHEMA = pa.schema(
         ("strike_price", pa.float64()),
         ("opening_oracle_price", pa.float64()),
         ("final_oracle_price", pa.float64()),
+        ("twap_initial", pa.float64()),
+        ("final_twap", pa.float64()),
         ("outcome", pa.string()),
+        ("outcome_source", pa.string()),
         ("tick_count", pa.int32()),
         ("complete", pa.bool_()),
     ]
@@ -86,6 +108,19 @@ TICK_SCHEMA = pa.schema(
         ("combined_ask", pa.float64()),
         ("yes_spread", pa.float64()),
         ("dist_from_strike", pa.float64()),
+        ("twap_diff", pa.float64()),
+        ("fair_yes", pa.float64()),
+        ("yes_ask_size", pa.float64()),
+        ("yes_bid_size", pa.float64()),
+        ("no_ask_size", pa.float64()),
+        ("no_bid_size", pa.float64()),
+        ("yes_ask_depth", pa.float64()),
+        ("yes_bid_depth", pa.float64()),
+        ("no_ask_depth", pa.float64()),
+        ("no_bid_depth", pa.float64()),
+        ("yes_last_trade", pa.float64()),
+        ("no_last_trade", pa.float64()),
+        ("traded_usd", pa.float64()),
     ]
 )
 
@@ -130,6 +165,9 @@ class WindowRow:
     final_oracle_price: float | None
     outcome: str | None
     archived: bool
+    twap_initial: float | None = None
+    final_twap: float | None = None
+    outcome_source: str | None = None
 
 
 def _iso_z(value: datetime) -> str:
@@ -156,6 +194,12 @@ def canonical_intervals(raw: list[str] | tuple[str, ...]) -> tuple[str, ...]:
     return tuple(interval for interval in config.INTERVALS if interval in wanted)
 
 
+def lookback_start(now: datetime) -> datetime:
+    """Earliest downloadable instant: UTC midnight, DATASET_LOOKBACK_DAYS days back."""
+    day = (now.astimezone(timezone.utc) - timedelta(days=config.DATASET_LOOKBACK_DAYS)).date()
+    return datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
+
+
 def parse_spec(
     *,
     start: datetime,
@@ -172,7 +216,19 @@ def parse_spec(
         raise SpecError("end must be after start")
     max_days = max(1, config.DATASET_MAX_RANGE_DAYS)
     if end_utc - start_utc > timedelta(days=max_days):
-        raise SpecError(f"range cannot exceed {max_days} days")
+        raise SpecError(
+            f"range cannot exceed {max_days} days. For more, contact {config.OWNER_CONTACT}"
+        )
+    now = datetime.fromtimestamp(
+        now_ts if now_ts is not None else datetime.now(timezone.utc).timestamp(), tz=timezone.utc
+    )
+    earliest = lookback_start(now)
+    if start_utc < earliest:
+        raise SpecError(
+            f"only the last {config.DATASET_LOOKBACK_DAYS} days can be downloaded "
+            f"(start must be on or after {earliest.strftime('%Y-%m-%dT%H:%M:%SZ')}). "
+            f"For older data, contact {config.OWNER_CONTACT}"
+        )
     if not assets:
         raise SpecError("assets must be a non-empty list")
     if not intervals:

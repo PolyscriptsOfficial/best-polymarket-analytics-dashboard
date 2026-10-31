@@ -222,6 +222,9 @@ def list_closed_windows(session: Session, spec: DatasetSpec) -> list[WindowRow]:
             Window.final_oracle_price,
             Window.outcome,
             Window.archived,
+            Window.twap_initial,
+            Window.final_twap,
+            Window.outcome_source,
         )
         .filter(*_spec_filters(spec))
         .order_by(Window.start_ts.asc(), Window.id.asc())
@@ -245,6 +248,9 @@ def list_closed_windows(session: Session, spec: DatasetSpec) -> list[WindowRow]:
                 final_oracle_price=_float(row[8]),
                 outcome=str(outcome) if outcome is not None else None,
                 archived=bool(row[10]),
+                twap_initial=_float(row[11]),
+                final_twap=_float(row[12]),
+                outcome_source=row[13],
             )
         )
     return out

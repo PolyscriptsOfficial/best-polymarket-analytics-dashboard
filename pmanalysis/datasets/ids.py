@@ -5,13 +5,13 @@ from __future__ import annotations
 import hashlib
 
 from pmanalysis import config
-from pmanalysis.datasets.schema import SCHEMA_VERSION, DatasetSpec
+from pmanalysis.datasets.schema import CONTRACT_REVISION, SCHEMA_VERSION, DatasetSpec
 
 
 def request_key(spec: DatasetSpec) -> str:
     return "|".join(
         (
-            f"v{SCHEMA_VERSION}",
+            f"v{SCHEMA_VERSION}r{CONTRACT_REVISION}",
             spec.iso_start(),
             spec.iso_end(),
             ",".join(spec.assets),
