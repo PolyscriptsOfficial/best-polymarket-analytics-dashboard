@@ -1,5 +1,4 @@
 const PAGE_SIZE = 200;
-let replayCharts = null;
 let currentTab = "windows";
 let pageOffset = 0;
 let pageTotal = 0;
@@ -18,12 +17,10 @@ function setFiltersForTab(tab) {
   const interval = document.getElementById("filter-interval");
   const side = document.getElementById("filter-side");
   const source = document.getElementById("filter-source");
-  const replay = document.getElementById("replay-panel");
 
   interval.classList.toggle("hidden", tab !== "windows");
   side.classList.toggle("hidden", tab !== "clob");
   source.classList.toggle("hidden", tab !== "oracle");
-  replay.classList.toggle("hidden", tab !== "windows");
 }
 
 function syncRawTabs(stats) {
@@ -54,7 +51,7 @@ async function loadStats() {
     syncRawTabs(s);
     el.innerHTML = [
       ["Windows", s.window_count],
-      ["Ticks (1s)", s.tick_count],
+      ["Ticks in SQLite (~24h)", s.tick_count],
       ["Binance trades", s.binance_trade_count],
       ["Oracle ticks", s.oracle_tick_count],
       ["CLOB quotes", s.clob_quote_count],
@@ -140,73 +137,29 @@ async function loadWindows() {
   pageTotal = data.total || 0;
   updatePager();
 
+  // Per-round CSV follows the public download window (older rounds: contact the owner).
+  const earliestMs = Date.parse(window.PM_DOWNLOAD?.earliest_start || "") || 0;
+  const icon = (name) => `<svg class="icon" aria-hidden="true"><use href="#i-${name}"/></svg>`;
+  const exportCell = (r) =>
+    r.start_ts * 1000 >= earliestMs
+      ? `<a class="export-link" href="/api/export/${r.id}?format=csv" title="Download this round's 1s data as CSV">${icon("download")} CSV</a>`
+      : `<span class="export-locked" title="Older than ${window.PM_DOWNLOAD?.lookback_days ?? 30} days: contact the owner">—</span>`;
+
   setTable(
     ["Slug", "Asset", "Interval", "End", "Strike", "Outcome", "Ticks", "Export"],
     rows
       .map(
         (r) => `<tr>
-      <td><a href="#" data-slug="${r.slug}">${r.slug}</a></td>
+      <td><a href="https://polymarket.com/event/${encodeURIComponent(r.slug)}" target="_blank" rel="noopener noreferrer" title="Open on Polymarket">${r.slug}</a></td>
       <td>${r.asset}</td><td>${r.interval}</td>
       <td>${new Date(r.end_ts * 1000).toLocaleString()}</td>
-      <td>${r.strike_price ?? "—"}</td><td>${r.outcome ?? "—"}</td>
+      <td>${PM.fmtUsdPrecise(r.strike_price)}</td><td>${r.outcome ?? "—"}</td>
       <td>${fmtNum(r.tick_count)}</td>
-      <td><a href="/api/export/${r.id}?format=csv">CSV</a></td>
+      <td>${exportCell(r)}</td>
     </tr>`
       )
       .join("")
   );
-
-  document.querySelectorAll("a[data-slug]").forEach((el) => {
-    el.addEventListener("click", async (e) => {
-      e.preventDefault();
-      document.querySelectorAll("#history-table tbody tr").forEach((row) => {
-        row.classList.remove("is-selected");
-      });
-      el.closest("tr")?.classList.add("is-selected");
-      const title = document.getElementById("replay-title");
-      if (title) title.textContent = el.dataset.slug;
-      const tickRes = await fetch(
-        `/api/windows/${encodeURIComponent(el.dataset.slug)}/ticks`
-      );
-      const tickData = await tickRes.json();
-      if (!tickRes.ok || !tickData.window) {
-        if (title) title.textContent = "Window not found";
-        return;
-      }
-      if (!replayCharts) {
-        replayCharts = new PM.DualCharts(
-          document.getElementById("replay-oracle"),
-          document.getElementById("replay-prob")
-        );
-      }
-      const points = (tickData.ticks || []).map((t) => ({
-        ts_ms: t.ts_ms,
-        oracle_price: t.oracle_price,
-        binance_price: t.binance_price,
-        twap_oracle: t.twap_oracle,
-        yes_ask: t.yes_ask,
-        no_ask: t.no_ask,
-        yes_mid: t.yes_mid,
-        no_mid: t.no_mid,
-      }));
-      const startTs = tickData.window.start_ts;
-      const twapInitial = PM.twapInitialFromPoints(points, startTs);
-      replayCharts.setHistory(
-        points,
-        twapInitial ?? tickData.window.strike_price,
-        startTs,
-        tickData.window.end_ts,
-        tickData.window.opening_oracle_price ?? null,
-        PM.openingBinanceFromPoints(points, startTs),
-        PM.openingProbFromPoints(points, startTs),
-        twapInitial
-      );
-      document.getElementById("replay-panel")?.scrollIntoView({
-        behavior: "smooth",
-        block: "nearest",
-      });
-    });
-  });
 }
 
 async function loadBinance() {

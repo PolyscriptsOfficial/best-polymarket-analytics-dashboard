@@ -1,8 +1,5 @@
 {% extends "base.html" %}
 {% block title %}History - Polymarket Analysis{% endblock %}
-{% block head %}
-<script src="/static/vendor/lightweight-charts.standalone.production.js"></script>
-{% endblock %}
 {% block body %}
 {% include "partials/topbar.html" %}
 <div class="page-container">
@@ -16,6 +13,75 @@
     <div class="win-rate-label">UP win rate</div>
     <div class="history-stats win-rate-stats" id="win-rate-stats">Loading win rates…</div>
   </div>
+
+  <section class="download-panel" id="download-panel" aria-labelledby="download-title">
+    <div class="download-head">
+      <h2 id="download-title" class="download-title">
+        <svg class="icon"><use href="#i-download"/></svg> Download historical data
+      </h2>
+      <p class="download-limit">
+        <svg class="icon"><use href="#i-calendar"/></svg>
+        Last {{ download.lookback_days }} days (UTC, from {{ download.earliest_start[:10] }})
+      </p>
+    </div>
+
+    <div class="download-body">
+      <div class="download-contents">
+        <p class="download-lead">One zip file for the markets and dates you pick, ready for backtesting a bot:</p>
+        <ul class="download-list">
+          <li>
+            <svg class="icon"><use href="#i-file"/></svg>
+            <span><strong>windows.parquet</strong>: one row per round, with start/end time, target (initial TWAP),
+            final TWAP, strike, outcome (UP/DOWN) and whether it came from Polymarket or our inference.</span>
+          </li>
+          <li>
+            <svg class="icon"><use href="#i-file"/></svg>
+            <span><strong>ticks/…/date=YYYY-MM-DD.parquet</strong>: one row per second, with Chainlink and Binance
+            prices, live TWAP and TWAP gap, YES/NO bid and ask, mids, spread, YES+NO, seconds left, order-book size
+            and 2¢ depth, last trades, USDC traded and the model's fair YES.</span>
+          </li>
+          <li>
+            <svg class="icon"><use href="#i-file"/></svg>
+            <span><strong>manifest.json</strong>: what is inside, row counts and SHA-256 checksums.</span>
+          </li>
+        </ul>
+        <p class="download-contact">
+          <svg class="icon"><use href="#i-mail"/></svg>
+          Need data older than {{ download.lookback_days }} days or a longer range?
+          <a href="{{ download.contact }}" target="_blank" rel="noopener noreferrer">Contact the owner
+            <svg class="icon"><use href="#i-external"/></svg></a>
+        </p>
+      </div>
+
+      <form class="download-form" id="download-form" novalidate>
+        <fieldset>
+          <legend>Markets</legend>
+          <div class="download-checks">
+            {% for asset in download.assets %}
+            <label><input type="checkbox" name="asset" value="{{ asset }}" checked> {{ asset }}</label>
+            {% endfor %}
+          </div>
+          <div class="download-checks">
+            {% for interval in download.intervals %}
+            <label><input type="checkbox" name="interval" value="{{ interval }}" checked> {{ interval }}</label>
+            {% endfor %}
+          </div>
+        </fieldset>
+        <div class="download-dates">
+          <label>From
+            <input type="date" name="start" required min="{{ download.earliest_start[:10] }}">
+          </label>
+          <label>To
+            <input type="date" name="end" required min="{{ download.earliest_start[:10] }}">
+          </label>
+        </div>
+        <button type="submit" class="download-btn" id="download-btn">
+          <svg class="icon"><use href="#i-download"/></svg> <span>Build &amp; download</span>
+        </button>
+        <p class="download-status" id="download-status" role="status" aria-live="polite"></p>
+      </form>
+    </div>
+  </section>
 
   <div class="history-tabs" id="history-tabs">
     <button type="button" class="history-tab active" data-tab="windows">Windows</button>
@@ -58,33 +124,13 @@
       <tbody></tbody>
     </table>
   </div>
-
-  <div class="chart-panel" id="replay-panel" style="margin-top:1rem">
-    <div class="chart-head">
-      <div class="chart-head-left">
-        <span id="replay-title">Window replay</span>
-        <div class="chart-legend" aria-hidden="true">
-          <span class="legend-item legend-binance">Binance spot</span>
-          <span class="legend-item legend-chainlink">Chainlink</span>
-          <span class="legend-item legend-twap">TWAP 60s</span>
-          <span class="legend-item legend-target">Target</span>
-        </div>
-      </div>
-    </div>
-    <div id="replay-oracle" class="chart-box"></div>
-    <div class="chart-head replay-prob-head">
-      <span class="chart-title">Probability</span>
-      <div class="chart-legend" aria-hidden="true">
-        <span class="legend-item legend-yes">YES ask</span>
-        <span class="legend-item legend-no">NO ask</span>
-      </div>
-    </div>
-    <div id="replay-prob" class="chart-box chart-box-sm"></div>
-  </div>
 </div>
 {% endblock %}
 {% block scripts %}
 <script src="/static/js/lib/format.js?v=term49"></script>
-<script src="/static/js/lib/charts.js?v=term59"></script>
-<script src="/static/js/history.js?v=term49"></script>
+<script>
+  window.PM_DOWNLOAD = {{ download | tojson }};
+</script>
+<script src="/static/js/history.js?v=term52"></script>
+<script src="/static/js/history_download.js?v=dl1"></script>
 {% endblock %}
