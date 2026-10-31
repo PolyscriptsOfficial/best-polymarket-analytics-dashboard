@@ -18,6 +18,8 @@ dependencies = [
     "pyarrow>=17.0.0",
     "jinja2>=3.1.0",
     "python-multipart>=0.0.9",
+    # IANA zones for Eastern Time regime stats (Windows ships no tz database).
+    "tzdata>=2024.1; platform_system == 'Windows'",
 ]
 
 [project.scripts]

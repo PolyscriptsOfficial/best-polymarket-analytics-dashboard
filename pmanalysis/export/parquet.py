@@ -5,73 +5,57 @@ from __future__ import annotations
 from pathlib import Path
 
 import pandas as pd
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from pmanalysis import config
-from pmanalysis.db.models import Indicator, Tick, Window
+from pmanalysis.db.models import Tick, Window
+from pmanalysis.db.tick_fields import STORED_TICK_COLUMNS, with_derived
 
 
-def _window_frame(session: Session, window: Window) -> pd.DataFrame:
-    ticks = (
-        session.query(Tick)
-        .filter_by(window_id=window.id)
+def window_frame(session: Session, window: Window) -> pd.DataFrame:
+    """Full 1s history of a window: SQLite while hot, else its parquet archive.
+
+    Hot frames hold ``ts_ms`` + STORED_TICK_COLUMNS; archives written before the
+    slim layout also carry derived columns. Readers derive what they need with
+    db/tick_fields.py either way.
+    """
+    rows = session.execute(
+        select(Tick.ts_ms, *(getattr(Tick, name) for name in STORED_TICK_COLUMNS))
+        .where(Tick.window_id == window.id)
         .order_by(Tick.ts_ms)
-        .all()
-    )
-    if not ticks:
+    ).all()
+    if not rows:
         archived = load_window_frame(window)
-        if archived is not None:
-            return archived
-        return pd.DataFrame()
-    indicators = {
-        row.ts_ms: row
-        for row in session.query(Indicator).filter_by(window_id=window.id).all()
-    }
-    rows = []
-    for tick in ticks:
-        ind = indicators.get(tick.ts_ms)
-        rows.append({
-            "ts_ms": tick.ts_ms,
-            "slug": window.slug,
-            "asset": window.asset,
-            "interval": window.interval,
-            "oracle_price": tick.oracle_price,
-            "binance_price": tick.binance_price,
-            "yes_ask": tick.yes_ask,
-            "yes_bid": tick.yes_bid,
-            "no_ask": tick.no_ask,
-            "no_bid": tick.no_bid,
-            "yes_mid": tick.yes_mid,
-            "no_mid": tick.no_mid,
-            "combined_ask": tick.combined_ask,
-            "yes_spread": tick.yes_spread,
-            "secs_remaining": tick.secs_remaining,
-            "dist_from_strike": tick.dist_from_strike,
-            "strike_price": window.strike_price,
-            "implied_yes_prob": ind.implied_yes_prob if ind else None,
-            "arb_edge": ind.arb_edge if ind else None,
-            "lean": ind.lean if ind else None,
-            "momentum_1m": ind.momentum_1m if ind else None,
-            "volatility_5m": ind.volatility_5m if ind else None,
-            "twap_oracle": getattr(ind, "twap_oracle", None) if ind else None,
-            "outcome": window.outcome,
-        })
-    return pd.DataFrame(rows)
+        return archived if archived is not None else pd.DataFrame()
+    # float64 even when a column is all-null, so every archive has one schema.
+    return pd.DataFrame(rows, columns=("ts_ms", *STORED_TICK_COLUMNS)).astype(
+        {name: "float64" for name in STORED_TICK_COLUMNS}
+    )
 
 
 def export_window_parquet(session: Session, window: Window) -> Path:
-    frame = _window_frame(session, window)
+    frame = window_frame(session, window)
     out_dir = config.ARCHIVE_DIR / window.asset.lower() / window.interval
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{window.slug}.parquet"
-    frame.to_parquet(out_path, index=False)
+    frame.to_parquet(out_path, index=False, compression="zstd")
     window.archived = True
     session.add(window)
     return out_path
 
 
 def export_window_csv(session: Session, window: Window) -> Path:
-    frame = _window_frame(session, window)
+    """Human-facing export: stored columns plus the derived ones (mids, spread, ...)."""
+    frame = window_frame(session, window)
+    if not frame.empty:
+        rows = with_derived(
+            frame.to_dict(orient="records"),
+            end_ts=window.end_ts,
+            strike_price=window.strike_price,
+            twap_initial=window.twap_initial,
+        )
+        frame = pd.DataFrame(rows)
     config.EXPORT_DIR.mkdir(parents=True, exist_ok=True)
     out_path = config.EXPORT_DIR / f"{window.slug}.csv"
     frame.to_csv(out_path, index=False)
@@ -85,7 +69,7 @@ def archive_path_for(asset: str, interval: str, slug: str) -> Path:
 def load_window_frame(window: Window) -> pd.DataFrame | None:
     """Read a finalized window's full tick history back from its parquet archive.
 
-    Used as the backtest data source once live SQLite ticks/indicators have been
+    Used as the backtest data source once live SQLite ticks have been
     pruned for storage/perf reasons (see db/cleanup.py retention job) — the archive
     is written once per window at finalize time and never touched again.
     """
