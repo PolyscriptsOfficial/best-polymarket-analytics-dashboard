@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timezone
 
+from pmanalysis.analytics.live import LiveAnalytics
 from pmanalysis.candles import CandleBook, hydrate_book, persist_candles
 from pmanalysis.collector.feed_recorder import FeedRecorder
 from pmanalysis.collector.gaps import GapTracker
+from pmanalysis.collector.alerts import AlertEngine, evaluate_market, feed_gap_alert
 from pmanalysis.collector.health import build_feed_row
-from pmanalysis.collector.live_emitter import build_live_tick
 from pmanalysis.collector.sampler import TickSampler
+from pmanalysis.collector.snapshot import SnapshotBuilder
 from pmanalysis.collector.window_cache import CachedWindow
 from pmanalysis.collector.window_manager import WindowManager
 from pmanalysis.collector.worker import CoalescingWorker, DbWriteWorker
@@ -22,16 +25,20 @@ from pmanalysis.config import (
     DISCOVERY_INTERVAL_SEC,
     FEED_RECORD_ENABLED,
     FEED_HEALTH_INTERVAL_SEC,
+    LEAD_LAG_REFRESH_SEC,
     LIVE_PUSH_MIN_INTERVAL_MS,
     OPENING_CAPTURE_DEBOUNCE_SEC,
     QUOTE_PUSH_INTERVAL_SEC,
+    RESOLUTION_RECHECK_INTERVAL_SEC,
     RETENTION_SWEEP_INTERVAL_SEC,
     ROLL_PREFETCH_SEC,
     ROLL_WATCH_INTERVAL_SEC,
     STRIKE_POLL_INTERVAL_SEC,
+    TWAP_WINDOW_SEC,
     WINDOW_ROLL_GRACE_SEC,
 )
 from pmanalysis.core.live_store import LiveStore, get_live_store
+from pmanalysis.db.features import compute_window_features
 from pmanalysis.db.session import get_session, init_db
 from pmanalysis.export.parquet import export_window_parquet
 from pmanalysis.feeds.binance import BinanceFeed
@@ -51,13 +58,12 @@ class CollectorService:
         self.clob = ClobFeed()
         self.window_manager = WindowManager(self.gamma)
         self.candles = CandleBook()
-        self.sampler = TickSampler(
-            self.window_manager,
-            self.chainlink,
-            self.clob,
-            binance=self.binance,
-            live_store=self.live_store,
+        self.analytics = LiveAnalytics()
+        self.builder = SnapshotBuilder(
+            self.chainlink, self.clob, self.analytics, binance=self.binance
         )
+        self.sampler = TickSampler(self.window_manager, self.builder)
+        self.alerts = AlertEngine(self.live_store.push_alert)
         self._tasks: list[asyncio.Task] = []
         self._token_ids: list[str] = []
         self._token_to_window_id: dict[str, int] = {}
@@ -122,6 +128,8 @@ class CollectorService:
             asyncio.create_task(self._retention_loop(), name="retention"),
             asyncio.create_task(self._stats_cache_loop(), name="stats-cache"),
             asyncio.create_task(self._feed_health_loop(), name="feed-health"),
+            asyncio.create_task(self._lead_lag_loop(), name="lead-lag"),
+            asyncio.create_task(self._resolution_recheck_loop(), name="resolution-recheck"),
         ]
         log.info(
             "Collector started with %d windows, %d token subscriptions (feed_record=%s)",
@@ -142,6 +150,7 @@ class CollectorService:
             await self._feed_recorder.stop()
             log.info("Feed recorder totals: %s", self._feed_recorder.counts)
         await self._db_worker.stop()
+        await self.alerts.close()
         await self.gamma.close()
         await self.clob.close()
         await self.chainlink.close()
@@ -182,6 +191,7 @@ class CollectorService:
 
             invalidate_history_cache(asset, interval)
         self.last_discovery_at = datetime.now(timezone.utc)
+        self.clob.prune_quotes(self._token_ids)
         await self._push_all_active_windows()
         if self._token_ids:
             changed = await self.clob.seed_tokens(self._token_ids)
@@ -256,6 +266,7 @@ class CollectorService:
                     last_prefetch = 0.0
                 if tokens != prev_tokens or rolled:
                     if tokens:
+                        self.clob.prune_quotes(tokens)
                         try:
                             await self.clob.seed_tokens(tokens)
                         except Exception as exc:
@@ -344,22 +355,31 @@ class CollectorService:
             return window.opening_oracle_price is not None and before is None
 
     async def _sampler_loop(self) -> None:
+        """Sample on whole-second boundaries so every tick's ts_ms is exact."""
+        step = COLLECTOR_TICK_INTERVAL_SEC
         while self._running:
+            await asyncio.sleep(step - (time.time() % step) + 0.005)
+            now_sec = int(time.time())
             try:
-                samples = await self._db_worker.run("sampler", self._sample_sync)
+                samples = await self._db_worker.run(
+                    "sampler", lambda: self._sample_sync(now_sec)
+                )
+                alerts = []
                 for sample in samples:
                     await self.live_store.push_tick(
                         sample.asset, sample.interval, sample.card, sample.point
                     )
+                    alerts.extend(evaluate_market(sample.state))
                 if samples:
                     self.last_tick_at = datetime.now(timezone.utc)
+                if alerts:
+                    await self.alerts.emit(alerts)
             except Exception as exc:
                 log.warning("sampler failed: %r", exc, exc_info=True)
-            await asyncio.sleep(COLLECTOR_TICK_INTERVAL_SEC)
 
-    def _sample_sync(self):
+    def _sample_sync(self, now_sec: int):
         with get_session() as session:
-            samples = self.sampler.sample_all(session)
+            samples = self.sampler.sample_all(session, now_sec)
         dirty = self.candles.take_dirty()
         if dirty:
             with get_session() as session:
@@ -377,21 +397,22 @@ class CollectorService:
             await asyncio.sleep(5)
 
     async def _retention_loop(self) -> None:
-        """Keep SQLite bounded: 1s ticks past retention, no raw-feed pile-up.
+        """Keep SQLite bounded: drop hot ticks after parquet archive.
 
-        Full window history stays in data/archive/*.parquet (UI and backtests
-        fall back to it when SQLite ticks have been pruned).
+        Runs off the serialized DB worker queue so 30-minute sweeps cannot stall
+        the 1 Hz sampler (which shares that queue for writes).
         """
         from pmanalysis.db.cleanup import run_retention
 
-        # Stagger the first sweep so it doesn't compete with collector startup.
         await asyncio.sleep(120)
         while self._running:
+            await asyncio.sleep(RETENTION_SWEEP_INTERVAL_SEC)
+            if not self._running:
+                break
             try:
-                await self._db_worker.run("retention", run_retention)
+                await asyncio.to_thread(run_retention)
             except Exception as exc:
                 log.warning("retention sweep failed: %r", exc, exc_info=True)
-            await asyncio.sleep(RETENTION_SWEEP_INTERVAL_SEC)
 
     def snapshot_feeds(self) -> list[dict]:
         """In-memory feed health for /status (does not touch SQLite)."""
@@ -425,9 +446,13 @@ class CollectorService:
 
                 def _persist():
                     with get_session() as session:
-                        self._gap_tracker.reconcile(session, snapshot)
+                        return self._gap_tracker.reconcile(session, snapshot)
 
-                await self._db_worker.run("feed-gaps", _persist)
+                opened = await self._db_worker.run("feed-gaps", _persist)
+                if opened:
+                    await self.alerts.emit(
+                        [feed_gap_alert(source, message) for source, message in opened]
+                    )
             except Exception as exc:
                 log.warning("feed health loop failed: %r", exc, exc_info=True)
             await asyncio.sleep(FEED_HEALTH_INTERVAL_SEC)
@@ -469,16 +494,67 @@ class CollectorService:
             finalized = await self.window_manager.finalize_expired(
                 session, now_ts, WINDOW_ROLL_GRACE_SEC, self.chainlink
             )
-            for window in finalized:
-                try:
-                    path = export_window_parquet(session, window)
-                    log.info("Archived %s -> %s", window.slug, path)
-                except Exception as exc:
-                    log.warning(
-                        "archive failed for %s: %r", window.slug, exc, exc_info=True
-                    )
-                await asyncio.sleep(0)
+            finalized_ids = [window.id for window in finalized]
+        # Parquet export + feature extraction are blocking (SQLite read, file
+        # write, pandas). Off the event loop, so the CLOB WebSocket reader keeps
+        # up at the roll — when both intervals finalize and the CLOB bursts book
+        # snapshots, a blocked loop gets the socket closed as a slow consumer.
+        # One job per window lets the 1 Hz sampler interleave on the worker.
+        for window_id in finalized_ids:
+            await self._db_worker.run(
+                "window-archive", lambda wid=window_id: self._archive_window_sync(wid)
+            )
         return finalized
+
+    def _archive_window_sync(self, window_id: int) -> None:
+        from pmanalysis.db.models import Window
+
+        with get_session() as session:
+            window = session.get(Window, window_id)
+            if window is None:
+                return
+            try:
+                path = export_window_parquet(session, window)
+                session.commit()  # the archive flag must not depend on features
+                log.info("Archived %s -> %s", window.slug, path)
+            except Exception as exc:
+                session.rollback()
+                log.warning("archive failed for %s: %r", window.slug, exc, exc_info=True)
+            try:
+                compute_window_features(session, window)
+                session.commit()
+            except Exception as exc:
+                session.rollback()
+                log.warning("features failed for %s: %r", window.slug, exc, exc_info=True)
+
+    async def _resolution_recheck_loop(self) -> None:
+        """Reconcile inferred outcomes with Gamma once it publishes a winner."""
+        while self._running:
+            await asyncio.sleep(RESOLUTION_RECHECK_INTERVAL_SEC)
+            try:
+                with get_session() as session:
+                    changed = await self.window_manager.recheck_inferred(
+                        session, int(time.time())
+                    )
+                    for window in changed:
+                        if window.outcome_mismatch:
+                            log.warning(
+                                "Outcome mismatch %s: Gamma %s vs inferred %s",
+                                window.slug,
+                                window.outcome,
+                                window.inferred_outcome,
+                            )
+            except Exception as exc:
+                log.warning("resolution recheck failed: %r", exc, exc_info=True)
+
+    async def _lead_lag_loop(self) -> None:
+        while self._running:
+            await asyncio.sleep(LEAD_LAG_REFRESH_SEC)
+            try:
+                payload = self.analytics.refresh_lead_lag(int(time.time()))
+                await self.live_store.set_lead_lag(payload)
+            except Exception as exc:
+                log.warning("lead/lag refresh failed: %r", exc, exc_info=True)
 
     async def _oracle_broadcast_loop(self) -> None:
         """Backfill chart history from feed buffers (prices stream on each tick)."""
@@ -519,11 +595,8 @@ class CollectorService:
             end_ts = card.get("end_ts") or 0
             if not asset or not start_ts or not end_ts:
                 continue
-            from pmanalysis.config import twap_window_for_interval
-
-            twap_win = twap_window_for_interval(interval or "5m")
             twap_pts = self.chainlink.twap_points_for_window(
-                asset, start_ts, end_ts, twap_win
+                asset, start_ts, end_ts, TWAP_WINDOW_SEC
             )
             if twap_pts:
                 await self.live_store.enrich_twap_history(
@@ -617,6 +690,7 @@ class CollectorService:
             return
         if FEED_RECORD_ENABLED:
             self._feed_recorder.record_binance(tick)
+        self.analytics.on_binance(asset, tick.get("ts_ms") or int(time.time() * 1000), price)
         self._pending_binance_prices[asset] = price
         self._schedule_price_flush()
 
@@ -629,6 +703,9 @@ class CollectorService:
         if FEED_RECORD_ENABLED and price is not None and not source.startswith("twap_"):
             self._feed_recorder.record_oracle(tick)
         if price is not None and source == "chainlink":
+            self.analytics.on_chainlink(
+                asset, tick.get("ts_ms") or int(time.time() * 1000), price
+            )
             self._pending_oracle_prices[asset] = price
             self._schedule_price_flush()
         if price is not None and source.startswith("twap_"):
@@ -731,19 +808,8 @@ class CollectorService:
             return
         self._last_live_push_ms[key] = ts_ms
 
-        state = self.sampler._state_for(window.id)
-        built = build_live_tick(
-            window,
-            self.chainlink,
-            self.clob,
-            self.window_manager,
-            state,
-            ts_ms,
-            self.binance,
-        )
-        if not built:
-            return
-        card, point = built
+        state = self.builder.build(window, ts_ms)
+        card, point = state.card(), state.point()
         self._note_candle(window, card)
         await self.live_store.push_tick(card.asset, card.interval, card, point)
 

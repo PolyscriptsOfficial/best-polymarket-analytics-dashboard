@@ -48,6 +48,46 @@ def _cmd_start() -> None:
     run_web(embed_collector=True)
 
 
+def _cmd_purge_broken(yes: bool, dry_run: bool, strict: bool) -> None:
+    from pmanalysis.db.cleanup import purge_broken_windows
+
+    if dry_run:
+        result = purge_broken_windows(dry_run=True, strict=strict)
+        print("Broken windows (dry run, no changes):")
+        print(f"  strict:     {result.get('strict')}")
+        print(f"  candidates: {result.get('candidates')}")
+        for key, count in sorted((result.get("reasons") or {}).items()):
+            if count:
+                print(f"  {key}: {count}")
+        return
+
+    if not yes:
+        print("Stop the collector first. This permanently deletes closed windows that are:")
+        if strict:
+            print("  - missing an outcome (UP/DOWN), or")
+            print("  - incomplete 1s tick series (same rules as /v1 dataset `complete`)")
+            print("  WARNING: strict mode can remove almost all history if feeds were gappy.")
+        else:
+            print("  - missing an outcome (UP/DOWN), or")
+            print("  - marked archived but parquet file is missing, or")
+            print("  - have zero tick rows in SQLite and parquet")
+        print("Use --strict to also drop gappy windows (dataset `complete` rules).")
+        print("Parquet archives and catalog rows for those windows are removed.")
+        answer = input("Type 'yes' to continue: ").strip().lower()
+        if answer != "yes":
+            print("Aborted.")
+            return
+
+    result = purge_broken_windows(dry_run=False, strict=strict)
+    print("Broken window purge complete.")
+    print(f"  windows removed:   {result.get('windows_removed')}")
+    print(f"  parquet removed:   {result.get('parquet_removed')}")
+    print(f"  ticks removed:     {result.get('ticks_removed')}")
+    for key, count in sorted((result.get("reasons") or {}).items()):
+        if count:
+            print(f"  {key}: {count}")
+
+
 def _cmd_prune_db(yes: bool, vacuum: bool) -> None:
     from pmanalysis.db.cleanup import compact_live_db, vacuum_db
     from pmanalysis.db.session import db_health, init_db
@@ -80,6 +120,36 @@ def _cmd_prune_db(yes: bool, vacuum: bool) -> None:
         print("VACUUM complete.")
     health = db_health()
     print(f"  db: {health.get('path')} ({health.get('size_mb')} MB)")
+
+
+def _cmd_backfill_features(limit: int | None, batch: int = 200) -> None:
+    """Compute window_snapshots / window features for resolved windows lacking them."""
+    from pmanalysis.collector.resolution import infer_outcome
+    from pmanalysis.db.features import compute_window_features, windows_missing_features
+    from pmanalysis.db.session import get_session, init_db
+
+    init_db()
+    done = skipped = 0
+    after_id = 0
+    while limit is None or done + skipped < limit:
+        size = batch if limit is None else min(batch, limit - done - skipped)
+        with get_session() as session:
+            windows = windows_missing_features(session, after_id=after_id, limit=size)
+            if not windows:
+                break
+            for window in windows:
+                after_id = window.id
+                features = compute_window_features(session, window)
+                if features is None or not features.snapshots:
+                    skipped += 1  # no 1s data left for this window
+                    continue
+                if window.inferred_outcome is None:
+                    window.inferred_outcome = infer_outcome(window)
+                # Commit per window: safe to run while the collector is writing.
+                session.commit()
+                done += 1
+        print(f"  {done} windows backfilled, {skipped} without 1s data", flush=True)
+    print(f"Backfill complete: {done} windows, {skipped} skipped.")
 
 
 def _check_deps() -> None:
@@ -115,6 +185,27 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="VACUUM SQLite afterwards so the file shrinks on disk",
     )
+    broken_p = sub.add_parser(
+        "purge-broken-windows",
+        help="Delete closed windows with incomplete ticks or missing outcomes",
+    )
+    broken_p.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompt")
+    broken_p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report how many windows would be removed without deleting",
+    )
+    broken_p.add_argument(
+        "--strict",
+        action="store_true",
+        help="Also drop windows failing dataset complete rules (95%% fill, gaps)",
+    )
+
+    backfill_p = sub.add_parser(
+        "backfill-features",
+        help="Compute research snapshots (calibration/regimes/backtest) for archived windows",
+    )
+    backfill_p.add_argument("--limit", type=int, default=None, help="Max windows to process")
 
     args = parser.parse_args(argv)
     _configure_logging(args.verbose)
@@ -128,6 +219,10 @@ def main(argv: list[str] | None = None) -> None:
         _cmd_start()
     elif args.command == "prune-db":
         _cmd_prune_db(yes=args.yes, vacuum=args.vacuum)
+    elif args.command == "purge-broken-windows":
+        _cmd_purge_broken(yes=args.yes, dry_run=args.dry_run, strict=args.strict)
+    elif args.command == "backfill-features":
+        _cmd_backfill_features(limit=args.limit)
     else:
         parser.print_help()
         sys.exit(1)
