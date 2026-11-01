@@ -19,7 +19,7 @@ from pmanalysis.datasets.client import fetch_dataset
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Fetch a period dataset zip from /v1/datasets")
-    parser.add_argument("--url", default=os.getenv("PM_DATASET_URL", "http://127.0.0.1:8000"))
+    parser.add_argument("--url", default=os.getenv("PM_DATASET_URL", "http://127.0.0.1:8420"))
     parser.add_argument("--start", required=True, help="Inclusive UTC instant, e.g. 2026-10-01T00:00:00Z")
     parser.add_argument("--end", required=True, help="Exclusive UTC instant")
     parser.add_argument("--asset", action="append", dest="assets", required=True)

@@ -1,10 +1,10 @@
-# VPS / remote access: bind 0.0.0.0:8000, open Windows firewall, start collector + web
+# VPS / remote access: bind 0.0.0.0:8420, open Windows firewall, start collector + web
 $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path $PSScriptRoot -Parent
 Set-Location $ProjectRoot
 
 $env:PM_HOST = "0.0.0.0"
-if (-not $env:PM_PORT) { $env:PM_PORT = "8000" }
+if (-not $env:PM_PORT) { $env:PM_PORT = "8420" }
 if (-not $env:PM_FEED_RECORD) { $env:PM_FEED_RECORD = "0" }
 
 $ruleName = "Polymarket Analysis (TCP $($env:PM_PORT))"

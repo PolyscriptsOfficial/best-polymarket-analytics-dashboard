@@ -1,14 +1,25 @@
+const fs = require("fs");
+const path = require("path");
+
+// Linux VPS: project venv. Windows: venv if present, else system Python
+// (scripts/_env.ps1 runs without a venv).
+function pythonPath() {
+  if (process.platform !== "win32") return ".venv/bin/python";
+  const venv = path.join(__dirname, ".venv", "Scripts", "python.exe");
+  return fs.existsSync(venv) ? venv : "python";
+}
+
 module.exports = {
   apps: [
     {
       name: "pmanalysis",
       cwd: __dirname,
-      script: ".venv/bin/python",
+      script: pythonPath(),
       args: "-m pmanalysis start",
       interpreter: "none",
       env: {
         PM_HOST: "0.0.0.0",
-        PM_PORT: "8000",
+        PM_PORT: "8420",
         // Small-VPS throttles: the 62 Hz quote-push / 2 Hz REST book-poll
         // defaults pinned the CPU and starved the CLOB WebSocket reader
         // ("slow consumer"), and unthrottled httpx INFO logging grew the PM2
