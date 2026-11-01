@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -15,7 +16,17 @@ from fastapi.staticfiles import StaticFiles
 from pmanalysis import __version__
 from pmanalysis.collector.registry import get_collector, set_collector
 from pmanalysis.collector.service import CollectorService
-from pmanalysis.config import ASSETS, INTERVALS, INTERVAL_SECONDS, FEED_RECORD_ENABLED, WEB_HOST, WEB_PORT
+from pmanalysis.config import (
+    ASSETS,
+    DATASET_LOOKBACK_DAYS,
+    FEED_RECORD_ENABLED,
+    INTERVAL_SECONDS,
+    INTERVALS,
+    OWNER_CONTACT,
+    WEB_HOST,
+    WEB_PORT,
+)
+from pmanalysis.datasets.schema import lookback_start
 from pmanalysis.datasets.service import DatasetService, set_dataset_service
 from pmanalysis.db.models import Window
 from pmanalysis.db.repository import (
@@ -38,6 +49,7 @@ from pmanalysis.web.render import render
 from pmanalysis.schemas import MarketCard
 from pmanalysis.web.sync import db_sync_loop, hydrate_live_store_from_db
 from pmanalysis.web.datasets import router as datasets_router
+from pmanalysis.web.research import router as research_router
 from pmanalysis.web.ws import manager as ws_manager
 
 log = logging.getLogger(__name__)
@@ -117,6 +129,7 @@ async def lifespan(app: FastAPI):
 def create_app() -> FastAPI:
     app = FastAPI(title="Polymarket Analysis", version=__version__, lifespan=lifespan)
     app.include_router(datasets_router)
+    app.include_router(research_router)
     app.mount("/static", StaticFiles(directory=str(WEB_DIR / "static")), name="static")
 
     @app.get("/favicon.ico", include_in_schema=False)
@@ -150,7 +163,31 @@ def create_app() -> FastAPI:
 
     @app.get("/history", response_class=HTMLResponse)
     async def history_page(request: Request):
-        return render(request, "history.html")
+        from pmanalysis.web.datasets import download_limits
+
+        return render(request, "history.html", download=download_limits())
+
+    @app.get("/grid", response_class=HTMLResponse)
+    async def grid_page(request: Request):
+        return render(
+            request,
+            "grid.html",
+            assets=ASSETS,
+            intervals=INTERVALS,
+            interval_seconds=INTERVAL_SECONDS,
+        )
+
+    @app.get("/research", response_class=HTMLResponse)
+    async def research_page(request: Request):
+        from pmanalysis.analytics.features import checkpoints_for
+
+        return render(
+            request,
+            "research.html",
+            assets=ASSETS,
+            intervals=INTERVALS,
+            checkpoints={interval: list(checkpoints_for(interval)) for interval in INTERVALS},
+        )
 
     @app.get("/status", response_class=HTMLResponse)
     async def status_page(request: Request):
@@ -380,6 +417,9 @@ def create_app() -> FastAPI:
                     return None
                 if format != "csv":
                     return "bad_format"
+                earliest = lookback_start(datetime.now(timezone.utc)).timestamp()
+                if window.start_ts < earliest:
+                    return "too_old"
                 return export_window_csv(session, window)
 
         path = await run_db(_load)
@@ -387,6 +427,12 @@ def create_app() -> FastAPI:
             raise HTTPException(404, "Window not found")
         if path == "bad_format":
             raise HTTPException(400, "Only csv download supported via API")
+        if path == "too_old":
+            raise HTTPException(
+                403,
+                f"Only the last {DATASET_LOOKBACK_DAYS} days can be downloaded. "
+                f"For older data, contact {OWNER_CONTACT}",
+            )
         return FileResponse(path, filename=path.name)
 
     return app
