@@ -17,6 +17,12 @@ PM.LiveSocket = class {
     this._send({ type: "select", asset, interval });
   }
 
+  /** Grid view: receive ticks for every market (no per-window history). */
+  selectAll() {
+    this._selected = null;
+    this._send({ type: "select_all" });
+  }
+
   _send(payload) {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(payload));
@@ -41,7 +47,8 @@ PM.LiveSocket = class {
       this._connecting = false;
       this._retry = 1000;
       this.handlers.onStatus?.("connected");
-      this.select(this._selected.asset, this._selected.interval);
+      if (this._selected) this.select(this._selected.asset, this._selected.interval);
+      else this.selectAll();
     };
 
     ws.onclose = () => {
@@ -66,6 +73,7 @@ PM.LiveSocket = class {
         else if (msg.type === "oracle") this.handlers.onOracle?.(msg);
         else if (msg.type === "history") this.handlers.onHistory?.(msg);
         else if (msg.type === "tick") this.handlers.onTick?.(msg);
+        else if (msg.type === "alert") this.handlers.onAlert?.(msg);
       } catch (e) {
         console.error("ws parse", e);
       }

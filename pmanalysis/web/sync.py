@@ -6,11 +6,34 @@ import asyncio
 import logging
 
 from pmanalysis.core.live_store import TickPoint, get_live_store, market_key
-from pmanalysis.db.models import Indicator, Tick, Window
+from pmanalysis.db.models import Tick, Window
+from pmanalysis.db.tick_fields import with_derived
 from pmanalysis.db.repository import active_window, build_market_cards, latest_oracle_prices
 from pmanalysis.db.session import get_session, run_db
 
 log = logging.getLogger(__name__)
+
+_POINT_STORED = (
+    "oracle_price",
+    "binance_price",
+    "twap_oracle",
+    "yes_ask",
+    "yes_bid",
+    "no_ask",
+    "no_bid",
+    "fair_yes",
+)
+_POINT_FIELDS = (
+    "ts_ms",
+    *_POINT_STORED,
+    "yes_mid",
+    "no_mid",
+    "combined_ask",
+    "dist_from_strike",
+    "arb_edge",
+    "lean",
+    "twap_diff",
+)
 
 _db_lock = asyncio.Lock()
 _history_loaded_slugs: set[str] = set()
@@ -33,42 +56,22 @@ def invalidate_history_cache(asset: str, interval: str) -> None:
 
 def load_history_points(session, window: Window) -> list[TickPoint]:
     """All sampled ticks for a window (YES/NO + oracle) for chart backfill."""
-    ticks = (
-        session.query(Tick)
+    rows = [
+        {"ts_ms": ts_ms, **dict(zip(_POINT_STORED, values))}
+        for ts_ms, *values in session.query(
+            Tick.ts_ms, *(getattr(Tick, name) for name in _POINT_STORED)
+        )
         .filter_by(window_id=window.id)
         .order_by(Tick.ts_ms)
         .all()
+    ]
+    rows = with_derived(
+        rows,
+        end_ts=window.end_ts,
+        strike_price=window.strike_price,
+        twap_initial=window.twap_initial,
     )
-    if not ticks:
-        return []
-    indicators = {
-        row.ts_ms: row
-        for row in session.query(Indicator)
-        .filter_by(window_id=window.id)
-        .all()
-    }
-    points: list[TickPoint] = []
-    for t in ticks:
-        ind = indicators.get(t.ts_ms)
-        points.append(
-            TickPoint(
-                ts_ms=t.ts_ms,
-                oracle_price=t.oracle_price,
-                binance_price=t.binance_price,
-                yes_mid=t.yes_mid,
-                no_mid=t.no_mid,
-                yes_ask=t.yes_ask,
-                yes_bid=t.yes_bid,
-                no_ask=t.no_ask,
-                no_bid=t.no_bid,
-                combined_ask=t.combined_ask,
-                dist_from_strike=t.dist_from_strike,
-                arb_edge=ind.arb_edge if ind else None,
-                lean=ind.lean if ind else None,
-                twap_oracle=getattr(ind, "twap_oracle", None) if ind else None,
-            )
-        )
-    return points
+    return [TickPoint(**{name: row.get(name) for name in _POINT_FIELDS}) for row in rows]
 
 
 def _load_history_sync(asset: str, interval: str) -> list[TickPoint]:

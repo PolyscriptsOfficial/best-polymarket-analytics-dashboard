@@ -10,7 +10,12 @@ from typing import Callable
 
 from pmanalysis.schemas import MarketCard
 
-HISTORY_MAX = 720
+# Chart history is kept per wall-clock second, so its size is bounded by time
+# (a full 15m window + margin) instead of by how many pushes happened. A count
+# cap (720) used to evict most of a 15m window: live pushes arrive several
+# times a second and feed backfills added Binance/Chainlink points on top.
+HISTORY_MAX_SEC = 15 * 60 + 120
+_FEED_FIELDS = ("oracle_price", "binance_price", "twap_oracle")
 
 
 def market_key(asset: str, interval: str) -> str:
@@ -33,6 +38,8 @@ class TickPoint:
     no_ask: float = 0.0
     no_bid: float = 0.0
     twap_oracle: float | None = None
+    twap_diff: float | None = None
+    fair_yes: float | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -50,7 +57,72 @@ class TickPoint:
             "arb_edge": self.arb_edge,
             "lean": self.lean,
             "twap_oracle": self.twap_oracle,
+            "twap_diff": self.twap_diff,
+            "fair_yes": self.fair_yes,
         }
+
+
+class SecondHistory:
+    """One merged TickPoint per second, oldest seconds dropped beyond max_seconds."""
+
+    __slots__ = ("_by_sec", "max_seconds")
+
+    def __init__(self, max_seconds: int = HISTORY_MAX_SEC) -> None:
+        self._by_sec: dict[int, TickPoint] = {}
+        self.max_seconds = max_seconds
+
+    def __len__(self) -> int:
+        return len(self._by_sec)
+
+    def __iter__(self):
+        return iter(self.points())
+
+    def points(self) -> list[TickPoint]:
+        return [self._by_sec[sec] for sec in sorted(self._by_sec)]
+
+    def add(self, point: TickPoint) -> None:
+        """Latest push in a second wins; feed prices it lacks are kept."""
+        sec = point.ts_ms // 1000
+        prev = self._by_sec.get(sec)
+        if prev is not None:
+            for name in _FEED_FIELDS:
+                if getattr(point, name) is None:
+                    setattr(point, name, getattr(prev, name))
+        self._by_sec[sec] = point
+        self._trim()
+
+    def fill(self, name: str, ts_ms: int, value: float) -> None:
+        """Set a feed price for its second without displacing quote data."""
+        sec = ts_ms // 1000
+        point = self._by_sec.get(sec)
+        if point is None:
+            self._by_sec[sec] = _feed_point(ts_ms, **{name: value})
+            self._trim()
+        elif getattr(point, name) is None:
+            setattr(point, name, value)
+
+    def _trim(self) -> None:
+        if len(self._by_sec) <= self.max_seconds:
+            return
+        floor = max(self._by_sec) - self.max_seconds
+        for sec in [s for s in self._by_sec if s <= floor]:
+            del self._by_sec[sec]
+
+
+def _feed_point(ts_ms: int, **prices: float) -> TickPoint:
+    """History stub carrying only feed prices (no quotes yet for that second)."""
+    return TickPoint(
+        ts_ms=ts_ms,
+        oracle_price=prices.get("oracle_price"),
+        binance_price=prices.get("binance_price"),
+        twap_oracle=prices.get("twap_oracle"),
+        yes_mid=0.0,
+        no_mid=0.0,
+        combined_ask=0.0,
+        dist_from_strike=None,
+        arb_edge=None,
+        lean=None,
+    )
 
 
 @dataclass
@@ -62,17 +134,21 @@ class LiveStore:
         default_factory=lambda: {"30": {}, "60": {}}
     )
     markets: dict[str, MarketCard] = field(default_factory=dict)
-    history: dict[str, deque[TickPoint]] = field(default_factory=dict)
+    history: dict[str, SecondHistory] = field(default_factory=dict)
     updated_at: datetime | None = None
     seq: int = 0
     _tick_queue: deque[tuple[int, dict]] = field(default_factory=lambda: deque(maxlen=300))
+    # Per-asset Binance->Chainlink lead/lag + basis (analytics/lead_lag.py).
+    lead_lag: dict[str, dict] = field(default_factory=dict)
+    alert_seq: int = 0
+    _alert_queue: deque[tuple[int, dict]] = field(default_factory=lambda: deque(maxlen=50))
     _oracle_dirty: bool = False
     _event: asyncio.Event = field(default_factory=asyncio.Event)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
-    def _history_for(self, key: str) -> deque[TickPoint]:
+    def _history_for(self, key: str) -> SecondHistory:
         if key not in self.history:
-            self.history[key] = deque(maxlen=HISTORY_MAX)
+            self.history[key] = SecondHistory()
         return self.history[key]
 
     async def push_tick(
@@ -86,9 +162,9 @@ class LiveStore:
         async with self._lock:
             prev = self.markets.get(key)
             if prev and prev.slug != card.slug:
-                self.history[key] = deque(maxlen=HISTORY_MAX)
+                self.history[key] = SecondHistory()
             self.markets[key] = card
-            self._history_for(key).append(point)
+            self._history_for(key).add(point)
             if point.oracle_price is not None:
                 self.oracle_prices[asset] = point.oracle_price
             if point.binance_price is not None:
@@ -103,6 +179,22 @@ class LiveStore:
                 "point": point.to_dict(),
             }
             self._tick_queue.append((self.seq, payload))
+        self._event.set()
+
+    async def push_alert(self, payload: dict) -> None:
+        async with self._lock:
+            self.alert_seq += 1
+            self._alert_queue.append((self.alert_seq, payload))
+        self._event.set()
+
+    async def drain_alerts(self, since_seq: int) -> tuple[list[dict], int]:
+        async with self._lock:
+            return [p for seq, p in self._alert_queue if seq > since_seq], self.alert_seq
+
+    async def set_lead_lag(self, payload: dict[str, dict]) -> None:
+        async with self._lock:
+            self.lead_lag = dict(payload)
+            self._oracle_dirty = True
         self._event.set()
 
     async def set_oracle_prices(self, oracle: dict[str, float]) -> None:
@@ -183,7 +275,7 @@ class LiveStore:
     async def clear_history(self, asset: str, interval: str) -> None:
         key = market_key(asset, interval)
         async with self._lock:
-            self.history[key] = deque(maxlen=HISTORY_MAX)
+            self.history[key] = SecondHistory()
         self._event.set()
 
     async def load_history(
@@ -194,9 +286,16 @@ class LiveStore:
     ) -> None:
         key = market_key(asset, interval)
         async with self._lock:
-            buf = deque(maxlen=HISTORY_MAX)
-            buf.extend(points[-HISTORY_MAX:])
-            self.history[key] = buf
+            # Merge stored 1s ticks under what live pushes already added: the
+            # DB covers the whole window, live pushes the latest seconds.
+            buf = self._history_for(key)
+            live = buf.points()
+            fresh = SecondHistory()
+            for point in points:
+                fresh.add(point)
+            for point in live:
+                fresh.add(point)
+            self.history[key] = fresh
         self._event.set()
 
     async def wait_update(self, timeout: float = 2.0) -> None:
@@ -214,8 +313,9 @@ class LiveStore:
     def has_pending_update(self) -> bool:
         return self._event.is_set()
 
-    def _twap_payload(self) -> dict:
+    def _feed_payload(self) -> dict:
         return {
+            "lead_lag": dict(self.lead_lag),
             "twap_prices": dict(self.twap_prices),
             "twap_by_window": {
                 "30": dict(self.twap_by_window.get("30") or {}),
@@ -230,7 +330,7 @@ class LiveStore:
                 "ts_ms": int(datetime.now(timezone.utc).timestamp() * 1000),
                 "oracle_prices": dict(self.oracle_prices),
                 "binance_prices": dict(self.binance_prices),
-                **self._twap_payload(),
+                **self._feed_payload(),
                 "markets": [m.model_dump() for m in self.markets.values()],
             }
 
@@ -253,34 +353,13 @@ class LiveStore:
         key = market_key(asset, interval)
         async with self._lock:
             buf = self._history_for(key)
-            by_ts = {p["ts_ms"]: p["oracle_price"] for p in oracle_points if p.get("oracle_price")}
-            for point in buf:
-                if point.oracle_price is not None:
-                    continue
-                matched = by_ts.get(point.ts_ms)
-                if matched is None and price_at:
-                    matched = price_at(point.ts_ms // 1000)
-                if matched is not None:
-                    point.oracle_price = matched
-            existing = {p.ts_ms for p in buf}
             for op in oracle_points:
-                ts_ms = op.get("ts_ms")
-                price = op.get("oracle_price")
-                if not ts_ms or price is None or ts_ms in existing:
-                    continue
-                buf.append(
-                    TickPoint(
-                        ts_ms=ts_ms,
-                        oracle_price=price,
-                        yes_mid=0.0,
-                        no_mid=0.0,
-                        combined_ask=0.0,
-                        dist_from_strike=None,
-                        arb_edge=None,
-                        lean=None,
-                    )
-                )
-                existing.add(ts_ms)
+                if op.get("ts_ms") and op.get("oracle_price"):
+                    buf.fill("oracle_price", op["ts_ms"], op["oracle_price"])
+            if price_at:
+                for point in buf.points():
+                    if point.oracle_price is None:
+                        point.oracle_price = price_at(point.ts_ms // 1000)
         self._event.set()
 
     async def enrich_binance_history(
@@ -297,37 +376,9 @@ class LiveStore:
         key = market_key(asset, interval)
         async with self._lock:
             buf = self._history_for(key)
-            by_ts = {
-                p["ts_ms"]: p["binance_price"]
-                for p in binance_points
-                if p.get("binance_price") is not None
-            }
-            for point in buf:
-                if point.binance_price is not None:
-                    continue
-                matched = by_ts.get(point.ts_ms)
-                if matched is not None:
-                    point.binance_price = matched
-            existing = {p.ts_ms for p in buf}
             for bp in binance_points:
-                ts_ms = bp.get("ts_ms")
-                price = bp.get("binance_price")
-                if not ts_ms or price is None or ts_ms in existing:
-                    continue
-                buf.append(
-                    TickPoint(
-                        ts_ms=ts_ms,
-                        oracle_price=None,
-                        binance_price=price,
-                        yes_mid=0.0,
-                        no_mid=0.0,
-                        combined_ask=0.0,
-                        dist_from_strike=None,
-                        arb_edge=None,
-                        lean=None,
-                    )
-                )
-                existing.add(ts_ms)
+                if bp.get("ts_ms") and bp.get("binance_price") is not None:
+                    buf.fill("binance_price", bp["ts_ms"], bp["binance_price"])
         self._event.set()
 
     async def enrich_twap_history(
@@ -344,56 +395,30 @@ class LiveStore:
         key = market_key(asset, interval)
         async with self._lock:
             buf = self._history_for(key)
-            by_ts = {
-                p["ts_ms"]: p["twap_oracle"]
-                for p in twap_points
-                if p.get("twap_oracle") is not None
-            }
-            for point in buf:
-                if point.twap_oracle is not None:
-                    continue
-                matched = by_ts.get(point.ts_ms)
-                if matched is not None:
-                    point.twap_oracle = matched
-            # Nearest prior TWAP for points without an exact timestamp match.
             ordered = sorted(
-                ((p["ts_ms"], p["twap_oracle"]) for p in twap_points if p.get("twap_oracle") is not None),
-                key=lambda row: row[0],
+                (p["ts_ms"], p["twap_oracle"])
+                for p in twap_points
+                if p.get("ts_ms") and p.get("twap_oracle") is not None
             )
+            for ts_ms, price in ordered:
+                buf.fill("twap_oracle", ts_ms, price)
+            # Seconds without their own sample carry the nearest prior TWAP.
             if ordered:
-                for point in buf:
-                    if point.twap_oracle is not None:
-                        continue
-                    prior = [price for ts, price in ordered if ts <= point.ts_ms]
-                    if prior:
-                        point.twap_oracle = prior[-1]
-            existing = {p.ts_ms for p in buf}
-            for tp in twap_points:
-                ts_ms = tp.get("ts_ms")
-                price = tp.get("twap_oracle")
-                if not ts_ms or price is None or ts_ms in existing:
-                    continue
-                buf.append(
-                    TickPoint(
-                        ts_ms=ts_ms,
-                        oracle_price=None,
-                        twap_oracle=price,
-                        yes_mid=0.0,
-                        no_mid=0.0,
-                        combined_ask=0.0,
-                        dist_from_strike=None,
-                        arb_edge=None,
-                        lean=None,
-                    )
-                )
-                existing.add(ts_ms)
+                idx, prior = 0, None
+                for point in buf.points():
+                    while idx < len(ordered) and ordered[idx][0] <= point.ts_ms:
+                        prior = ordered[idx][1]
+                        idx += 1
+                    if point.twap_oracle is None and prior is not None:
+                        point.twap_oracle = prior
         self._event.set()
 
     async def get_history_payload(self, asset: str, interval: str) -> dict:
         key = market_key(asset, interval)
         async with self._lock:
             card = self.markets.get(key)
-            points = list(self.history.get(key, []))
+            buf = self.history.get(key)
+            points = buf.points() if buf is not None else []
             if card and card.start_ts and card.end_ts:
                 start_ms = card.start_ts * 1000
                 end_ms = card.end_ts * 1000
@@ -415,15 +440,18 @@ class LiveStore:
         }
 
     async def drain_tick_updates(
-        self, since_seq: int, asset: str, interval: str
+        self, since_seq: int, asset: str | None, interval: str | None
     ) -> tuple[list[dict], int]:
+        """Queued ticks after since_seq for one market (asset=None: all markets)."""
         async with self._lock:
             updates = [
                 payload
                 for seq, payload in self._tick_queue
                 if seq > since_seq
-                and payload.get("asset") == asset
-                and payload.get("interval") == interval
+                and (
+                    asset is None
+                    or (payload.get("asset") == asset and payload.get("interval") == interval)
+                )
             ]
             return updates, self.seq
 
@@ -437,7 +465,7 @@ class LiveStore:
                 "ts_ms": int(datetime.now(timezone.utc).timestamp() * 1000),
                 "oracle_prices": dict(self.oracle_prices),
                 "binance_prices": dict(self.binance_prices),
-                **self._twap_payload(),
+                **self._feed_payload(),
             }
 
     async def get_tick_payload(

@@ -117,6 +117,7 @@ class ConnectionManager:
             if not await self._send_history(ws, store, asset, interval):
                 return
             last_tick_seq = store.seq
+            last_alert_seq = store.alert_seq
 
             drain_timeout = max(0.001, WS_DRAIN_TIMEOUT_SEC)
             while self._is_connected(ws):
@@ -124,7 +125,11 @@ class ConnectionManager:
                     # Short receive poll so we can drain feed updates quickly.
                     raw = await asyncio.wait_for(ws.receive_text(), timeout=drain_timeout)
                     msg = json.loads(raw)
-                    if msg.get("type") == "select":
+                    if msg.get("type") == "select_all":
+                        # Grid view: every market's ticks, no per-window history.
+                        self._selection[ws] = (None, None)
+                        last_tick_seq = store.seq
+                    elif msg.get("type") == "select":
                         asset = str(msg.get("asset", "BTC")).upper()
                         interval = str(msg.get("interval", "5m"))
                         if asset in ASSETS and interval in INTERVALS:
@@ -185,6 +190,15 @@ class ConnectionManager:
                     )
 
                 if oracle_payload and not await self.send_json(ws, oracle_payload):
+                    break
+
+                alerts, last_alert_seq = await store.drain_alerts(last_alert_seq)
+                send_failed = False
+                for alert in alerts:
+                    if not await self.send_json(ws, alert):
+                        send_failed = True
+                        break
+                if send_failed:
                     break
 
                 send_failed = False
