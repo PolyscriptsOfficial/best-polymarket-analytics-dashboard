@@ -21,12 +21,25 @@ function fmtNum(n) {
   return Number(n).toLocaleString();
 }
 
+const SOURCE_ICONS = { binance: "trend", chainlink: "link", clob: "layers" };
+const STATUS_ICONS = {
+  ok: "check-circle",
+  stale: "alert",
+  down: "x-circle",
+  waiting: "clock",
+  idle: "pause",
+};
+
+function icon(name) {
+  return `<svg class="icon" aria-hidden="true"><use href="#i-${name}"/></svg>`;
+}
+
 function feedCard(feed) {
-  const status = feed.status || "waiting";
+  const status = STATUS_ICONS[feed.status] ? feed.status : "waiting";
   return `<article class="status-card feed-card feed-${status}">
     <div class="feed-card-head">
-      <h3>${feed.label || feed.source}</h3>
-      <span class="status-pill status-${status}">${status}</span>
+      <h3>${icon(SOURCE_ICONS[feed.source] || "pulse")} ${feed.label || feed.source}</h3>
+      <span class="status-pill status-${status}">${icon(STATUS_ICONS[status])} ${status}</span>
     </div>
     <p>Lag: <strong>${fmtLag(feed.lag_sec)}</strong></p>
     <p>Threshold: ${fmtLag(feed.threshold_sec)}</p>
@@ -88,17 +101,52 @@ async function refreshStatus() {
   setText("st-db-size", `${data.size_mb ?? "—"} MB`);
   setText("st-windows", fmtNum(data.window_count));
   setText("st-ticks", fmtNum(data.tick_count));
+  setText("st-ticks-written", fmtNum(data.ticks_written));
   setText("st-binance", fmtNum(data.binance_trade_count));
   setText("st-oracle", fmtNum(data.oracle_tick_count));
   setText("st-clob", fmtNum(data.clob_quote_count));
 
   const updated = document.getElementById("status-updated");
-  if (updated) updated.textContent = `Updated ${new Date().toLocaleTimeString()}`;
+  if (updated) updated.innerHTML = `${icon("clock")} Updated ${new Date().toLocaleTimeString()}`;
+}
+
+async function refreshAudit() {
+  const res = await fetch("/api/research/resolution");
+  if (!res.ok) return;
+  const data = await res.json();
+  setText(
+    "audit-summary",
+    `${fmtNum(data.gamma)} resolved by Gamma · ${fmtNum(data.inferred)} on inference only · ` +
+      `${fmtNum(data.mismatches)} mismatches`
+  );
+  const body = document.querySelector("#audit-table tbody");
+  if (!body) return;
+  const usd = (v) => (v == null ? "—" : `$${Number(v).toFixed(2)}`);
+  body.replaceChildren(
+    ...(data.recent_mismatches.length
+      ? data.recent_mismatches.map((w) => {
+          const tr = document.createElement("tr");
+          for (const text of [
+            w.slug,
+            new Date(w.end_ts * 1000).toLocaleString(),
+            w.outcome || "—",
+            w.inferred_outcome || "—",
+            usd(w.twap_initial),
+            usd(w.final_twap),
+          ]) {
+            const td = document.createElement("td");
+            td.textContent = text;
+            tr.append(td);
+          }
+          return tr;
+        })
+      : [Object.assign(document.createElement("tr"), { innerHTML: '<td colspan="6">No mismatches.</td>' })])
+  );
 }
 
 async function loop() {
   try {
-    await refreshStatus();
+    await Promise.all([refreshStatus(), refreshAudit()]);
   } catch (err) {
     const hint = document.getElementById("status-updated");
     if (hint) hint.textContent = `Status refresh failed: ${err.message}`;
