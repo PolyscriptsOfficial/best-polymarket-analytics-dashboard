@@ -33,13 +33,20 @@
   let previewHasOlder = false;
   let previewHasNewer = false;
   let rollSeq = 0;
+  const HISTORY_RESYNC_MS = [6000, 20000];
+  const RESYNC_MIN_GAP_MS = 5000;
+  let resyncTimer = 0;
+  let lastResyncAt = 0;
   let previewTimer = 0;
+  let leadLag = {};
 
   const el = (id) => document.getElementById(id);
   const SLUG_CACHE_MS = 60000;
   const PREVIEW_COUNT = 7;
+  const PREVIEW_REFRESH_MS = 10000;
   const SIDEBAR_KEY = "pm.sidebarCollapsed";
   const NARROW_MQ = window.matchMedia("(max-width: 780px)");
+  const alerts = new PM.Alerts(el("alerts-toggle"), el("alert-stack"));
 
   function isNarrow() {
     return NARROW_MQ.matches;
@@ -291,6 +298,15 @@
     renderTicker();
     void refreshSlugDropdown(true);
     void loadSlugHistory(liveSlug).catch(() => {});
+    // The new window's stored ticks are still empty at the open (and the
+    // collector is busiest at 15m rolls); re-sync once they exist so the
+    // opening seconds are on the chart even if this tab missed live pushes.
+    for (const delay of HISTORY_RESYNC_MS) {
+      setTimeout(() => {
+        if (seq !== rollSeq || !viewingLive || charts?.hasWindowHistory()) return;
+        void loadSlugHistory(liveSlug).catch(() => {});
+      }, delay);
+    }
     void loadCandles();
     if (previewTimer) clearTimeout(previewTimer);
     previewTimer = setTimeout(() => {
@@ -299,6 +315,29 @@
       void loadRecentPreviews(true);
     }, 300);
   }
+
+  /**
+   * Replace the live lines with the window's stored 1s ticks. Used when live
+   * painting missed seconds it cannot fill honestly (tab hidden or throttled,
+   * slow roll); without it the gap showed as a flat line until a refresh.
+   */
+  function resyncLiveHistory() {
+    if (!viewingLive || resyncTimer) return;
+    const wait = Math.max(300, lastResyncAt + RESYNC_MIN_GAP_MS - Date.now());
+    resyncTimer = setTimeout(() => {
+      resyncTimer = 0;
+      if (!viewingLive) return;
+      lastResyncAt = Date.now();
+      snapToClockWindow();
+      if (liveSlug) void loadSlugHistory(liveSlug).catch(() => {});
+    }, wait);
+  }
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) return;
+    resyncLiveHistory();
+    if (previewPage === 0) void loadRecentPreviews(true, 0);
+  });
 
   function snapToClockWindow(forceChartReset = false) {
     if (!viewingLive) return false;
@@ -954,8 +993,13 @@
     setChartOpening(points, bounds?.start);
     const last = data.ticks.at(-1);
     const liveM = marketByKey[`${selected.asset}:${selected.interval}`];
+    // The live card's target only applies to the live slug; a past window
+    // uses its own stored open TWAP.
+    const liveTwapInitial = liveM?.slug === slug ? liveM.twap_initial : null;
     const twapInitial =
-      liveM?.twap_initial ?? PM.twapInitialFromPoints(points, bounds?.start);
+      liveTwapInitial ??
+      data.window.twap_initial ??
+      PM.twapInitialFromPoints(points, bounds?.start);
     const marketMeta = { twap_initial: twapInitial };
     if (points.length || !charts?.hasWindowHistory()) {
       setChartHistory(points, twapInitial, bounds, marketMeta, data.window);
@@ -1131,6 +1175,51 @@
     if (label) label.textContent = String(previewPage + 1);
   }
 
+  /**
+   * Same cards as on screen (periodic refresh inside one window): update ticks,
+   * badge and count in place instead of rebuilding every chart. Returns false
+   * when the card list changed and needs a full rebuild.
+   */
+  function refreshPreviewsInPlace(payloads) {
+    const list = el("recent-previews");
+    const cardEls = list ? [...list.querySelectorAll(".preview-card")] : [];
+    if (!payloads.length || cardEls.length !== payloads.length) return false;
+    if (previewCharts.length !== payloads.length) return false;
+    const same = payloads.every(
+      (p, i) => (p.window?.slug || "") === cardEls[i].dataset.slug && previewCharts[i].slug === cardEls[i].dataset.slug
+    );
+    if (!same) return false;
+    payloads.forEach((payload, i) => {
+      const w = payload.window || {};
+      const card = cardEls[i];
+      const isLiveWindow = !!(w.slug && liveSlug && w.slug === liveSlug);
+      const outcome = isLiveWindow ? { text: "LIVE", cls: "live" } : previewOutcomeMeta(w.outcome);
+      card.classList.toggle("win", outcome.cls === "up");
+      card.classList.toggle("lose", outcome.cls === "down");
+      card.classList.toggle("is-live-window", isLiveWindow);
+      card.classList.toggle("active", !!(w.slug && w.slug === selectedSlug));
+      const meta = card.querySelector(".preview-card-meta");
+      if (meta) {
+        meta.className = `preview-card-meta ${outcome.cls}`;
+        meta.textContent = outcome.text;
+      }
+      const count = card.querySelector(".preview-card-foot span");
+      if (count) {
+        count.textContent = `${payload.tick_count != null ? payload.tick_count : (payload.ticks || []).length} ticks`;
+      }
+      previewCharts[i].setData(payload.ticks || []);
+    });
+    return true;
+  }
+
+  // The live card is fetched at the roll, when its window has no ticks yet, and
+  // the previous window is still unresolved: refresh the newest page while the
+  // tab is visible so the live preview grows and the last outcome appears.
+  setInterval(() => {
+    if (document.hidden || previewPage !== 0 || !previewCharts.length) return;
+    void loadRecentPreviews(true, 0);
+  }, PREVIEW_REFRESH_MS);
+
   async function loadRecentPreviews(force = false, page = null) {
     const key = `${selected.asset}:${selected.interval}`;
     const sub = el("preview-subtitle");
@@ -1184,13 +1273,15 @@
         return;
       }
 
+      const nowSec = Math.floor(Date.now() / 1000);
+      // Prefetched next window has no ticks yet — keep it off the sidebar.
+      const visible = payloads.filter((p) => !(p.window?.start_ts > nowSec));
+      if (refreshPreviewsInPlace(visible)) return;
+
       const frag = document.createDocumentFragment();
       const cards = [];
-      const nowSec = Math.floor(Date.now() / 1000);
-      payloads.forEach((payload) => {
+      visible.forEach((payload) => {
         const w = payload.window || {};
-        // Prefetched next window has no ticks yet — keep it off the sidebar.
-        if (w.start_ts && w.start_ts > nowSec) return;
         const isLiveWindow = !!(w.slug && liveSlug && w.slug === liveSlug);
         const outcome = isLiveWindow
           ? { text: "LIVE", cls: "live" }
@@ -1235,7 +1326,7 @@
           if (viewingLive) updateMetrics(marketByKey[`${selected.asset}:${selected.interval}`]);
         });
         frag.appendChild(card);
-        cards.push({ card, ticks: payload.ticks || [] });
+        cards.push({ card, ticks: payload.ticks || [], slug: w.slug || "" });
       });
       if (!cards.length) {
         destroyPreviews();
@@ -1250,6 +1341,7 @@
         const chartEl = item.card.querySelector(".preview-chart");
         const mini = new PM.MiniPreviewChart(chartEl);
         mini.setData(item.ticks);
+        mini.slug = item.slug;
         previewCharts.push(mini);
       }
     } catch (err) {
@@ -1336,6 +1428,14 @@
     const prob = el("prob-last");
     if (prob) prob.textContent = fmtQuotePair(m);
     updateOracleHero(m);
+    PM.renderEdgeStrip(m, leadLag[selected.asset]);
+  }
+
+  function applyLeadLag(msg) {
+    if (!msg?.lead_lag) return;
+    leadLag = msg.lead_lag;
+    const node = el("lead-lag");
+    if (node) node.textContent = PM.fmtLeadLag(leadLag[selected.asset]);
   }
 
   function updateSelectedHeader() {
@@ -1392,7 +1492,9 @@
 
   const socket = new PM.LiveSocket("/ws/live", {
     onStatus: setWsStatus,
+    onAlert: (msg) => alerts.handle(msg),
     onOracle: (msg) => {
+      applyLeadLag(msg);
       scheduleRenderTicker(msg.oracle_prices);
       if (!viewingLive || selectedSlug !== liveSlug || !charts) return;
       snapToClockWindow();
@@ -1423,6 +1525,7 @@
       updateOracleHero(m);
     },
     onSnapshot: (msg) => {
+      applyLeadLag(msg);
       for (const row of msg.markets || []) applyMarketCard(row);
       scheduleRenderTicker(msg.oracle_prices);
       renderNav();
@@ -1545,6 +1648,7 @@
       throw new Error("LightweightCharts failed to load");
     }
     charts = new PM.DualCharts(el("chart-oracle"), el("chart-prob"));
+    charts.onLiveGap = resyncLiveHistory;
     const candleEl = el("chart-candles");
     if (candleEl) {
       candleChart = new PM.CandleChart(candleEl);

@@ -102,6 +102,7 @@ PM.DualCharts = class {
     const twapColor = "#38bdf8";
     const yesColor = "#22c55e";
     const noColor = "#ef4444";
+    const fairColor = "#c27c1e";
     const fixedProbScale = {
       priceFormat: { type: "price", precision: 0, minMove: 1 },
       autoscaleInfoProvider: () => ({
@@ -148,6 +149,19 @@ PM.DualCharts = class {
       crosshairMarkerBackgroundColor: noColor,
       title: "NO ask",
     });
+    // Model fair value for YES (sparse; dashed so it never reads as a quote).
+    this.fairSeries = this.probChart.addLineSeries({
+      ...curvedLine,
+      ...fixedProbScale,
+      lineWidth: 2,
+      lineStyle: LightweightCharts.LineStyle.Dashed,
+      color: fairColor,
+      crosshairMarkerBorderColor: fairColor,
+      crosshairMarkerBackgroundColor: fairColor,
+      lastValueVisible: false,
+      title: "",
+    });
+    this._lastFairTime = -1;
 
     this._strikeLine = null;
     this._currentLine = null;
@@ -171,7 +185,8 @@ PM.DualCharts = class {
     this._pendingTs = null;
     this._endLabelW = 0;
     this._endLabelH = 16;
-    this._carry = { oracle: null, binance: null, twap: null, yes: null, no: null };
+    this._carry = { oracle: null, binance: null, twap: null, yes: null, no: null, fair: null };
+    this._painted = {};
     this._hasStart = { oracle: false, binance: false, twap: false, yes: false, no: false };
     this._twapInitial = null;
     this._syncingRange = false;
@@ -201,6 +216,7 @@ PM.DualCharts = class {
     this._probTooltipEntries = [
       { series: this.yesSeries, label: "YES ask", color: yesColor, format: (v) => `${Number(v).toFixed(1)}¢` },
       { series: this.noSeries, label: "NO ask", color: noColor, format: (v) => `${Number(v).toFixed(1)}¢` },
+      { series: this.fairSeries, label: "Fair YES", color: fairColor, format: (v) => `${Number(v).toFixed(1)}¢` },
     ];
     this._bindCrosshairSync();
 
@@ -210,6 +226,16 @@ PM.DualCharts = class {
     this._bindPriceScaleInteraction(this.probChart, probEl, "prob");
     this._applyFixedProbScale();
     this._syncCompactMode();
+
+    // A frame requested just before the tab was hidden would wait until it is
+    // shown again and block every paint in between: hand it to a timer.
+    this._onVisibility = () => {
+      if (!document.hidden || !this._paintRaf) return;
+      cancelAnimationFrame(this._paintRaf);
+      this._paintRaf = 0;
+      this._requestLiveUpdate(this._pendingIncludeProb, this._pendingTs);
+    };
+    document.addEventListener("visibilitychange", this._onVisibility);
   }
 
   _isCompact() {
@@ -808,21 +834,55 @@ PM.DualCharts = class {
     }
   }
 
-  _paintSeriesAt(chartTime, includeProb = true) {
-    if (this._carry.oracle != null) {
-      this.oracleSeries.update({ time: chartTime, value: this._carry.oracle });
-      this._setCurrentLine(this._carry.oracle);
+  /**
+   * series.update() throws when `time` is older than the series' last point
+   * (e.g. server clock ahead of ours). One skipped paint is harmless; letting
+   * it throw aborted every later paint and froze the chart for the window.
+   */
+  _update(series, time, value) {
+    try {
+      series.update({ time, value });
+      return true;
+    } catch (_) {
+      return false;
     }
-    if (this._carry.binance != null) {
-      this.binanceSeries.update({ time: chartTime, value: this._carry.binance });
+  }
+
+  /** Paint `vals` (default: the latest values) at chartTime and remember them as painted. */
+  _paintSeriesAt(chartTime, includeProb = true, vals = this._carry) {
+    const painted = this._painted;
+    if (vals.oracle != null) {
+      this._update(this.oracleSeries, chartTime, vals.oracle);
+      this._setCurrentLine(vals.oracle);
+      painted.oracle = vals.oracle;
     }
-    if (this._carry.twap != null) {
-      this.twapSeries.update({ time: chartTime, value: this._carry.twap });
+    if (vals.binance != null) {
+      this._update(this.binanceSeries, chartTime, vals.binance);
+      painted.binance = vals.binance;
     }
-    if (includeProb && this._carry.yes != null && this._carry.no != null) {
-      this.yesSeries.update({ time: chartTime, value: this._carry.yes });
-      this.noSeries.update({ time: chartTime, value: this._carry.no });
+    if (vals.twap != null) {
+      this._update(this.twapSeries, chartTime, vals.twap);
+      painted.twap = vals.twap;
     }
+    if (includeProb && vals.yes != null && vals.no != null) {
+      this._update(this.yesSeries, chartTime, vals.yes);
+      this._update(this.noSeries, chartTime, vals.no);
+      painted.yes = vals.yes;
+      painted.no = vals.no;
+    }
+    if (includeProb && vals.fair != null && chartTime >= this._lastFairTime) {
+      if (this._update(this.fairSeries, chartTime, vals.fair)) this._lastFairTime = chartTime;
+      painted.fair = vals.fair;
+    }
+  }
+
+  /** Values the lines hold right now; a gap is filled with these, not the newest quote. */
+  _paintedValues() {
+    const out = {};
+    for (const key of Object.keys(this._carry)) {
+      out[key] = this._painted[key] ?? this._carry[key];
+    }
+    return out;
   }
 
   _flushLivePaint(includeProb = true, tsMs = null) {
@@ -834,27 +894,45 @@ PM.DualCharts = class {
       chartTime = this._lastChartTime;
     }
 
-    this._seedStartFromCarry();
-
-    // Forward-fill missed 200ms slots so spacing stays linear. Cap each flush
-    // so a background tab does not apply thousands of updates in one frame.
-    // A 0:00 seed after switching 5m ↔ 15m is not history — do not stretch
-    // the current price across the elapsed window (flat line, empty YES/NO).
-    const MAX_CATCHUP = 50;
-    const stubSeed =
+    // First live paint well after 0:00 with no stored history (5m <-> 15m
+    // switch, or a roll whose history request was slow): start the lines at
+    // "now" instead of stretching the current price back to 0:00 as a fake
+    // flat line. Only true opening values seed 0:00; painting then continues.
+    const lateStart =
       !this._windowHistory &&
       this._lastChartTime <= this._chartStartTime() &&
-      chartTime - this._lastChartTime > this._timeScale * 2;
-    if (stubSeed) {
+      chartTime - Math.max(0, this._lastChartTime) > this._timeScale * 2;
+    if (lateStart) {
+      this._lateStart = true;
+      this._seedStartFromCarry();
+      this._paintSeriesAt(chartTime, includeProb);
+      this._lastChartTime = chartTime;
       this._syncEndLabels();
       return;
     }
+
+    this._seedStartFromCarry();
+
+    // Forward-fill missed 200ms slots so spacing stays linear (the time axis
+    // is index-based). Fill with what the lines already show: painting the
+    // newest quote back over the gap drew a flat line at today's price where
+    // the market actually moved. A long gap (tab hidden or throttled, slow
+    // roll) cannot be filled honestly from here: ask for the stored history.
+    const MAX_CATCHUP = 50;
     if (this._lastChartTime >= 0 && chartTime > this._lastChartTime + 1) {
+      const gap = chartTime - this._lastChartTime;
+      const held = this._paintedValues();
       const stepEnd = Math.min(chartTime, this._lastChartTime + MAX_CATCHUP);
       for (let t = this._lastChartTime + 1; t < stepEnd; t++) {
-        this._paintSeriesAt(t, includeProb);
+        this._paintSeriesAt(t, includeProb, held);
       }
-      chartTime = stepEnd;
+      if (gap > MAX_CATCHUP) {
+        chartTime = stepEnd;
+        this._lastChartTime = chartTime;
+        this.onLiveGap?.();
+        this._syncEndLabels();
+        return;
+      }
     }
 
     this._paintSeriesAt(chartTime, includeProb);
@@ -880,13 +958,21 @@ PM.DualCharts = class {
       this._syncLivePaintLoop();
     };
     const wait = Math.max(0, this._bucketMs - (performance.now() - this._lastPaintAt));
+    // requestAnimationFrame never fires in a hidden or fully covered window. A
+    // pending frame then blocked every later paint, and after a roll (which
+    // stops the paint loop) nothing restarted it. Use a timer while hidden.
+    if (document.hidden) {
+      this._paintWait = setTimeout(run, wait);
+      return;
+    }
     if (wait <= 16) {
       this._paintRaf = requestAnimationFrame(run);
       return;
     }
     this._paintWait = setTimeout(() => {
       this._paintWait = 0;
-      this._paintRaf = requestAnimationFrame(run);
+      if (document.hidden) run();
+      else this._paintRaf = requestAnimationFrame(run);
     }, wait);
   }
 
@@ -917,6 +1003,7 @@ PM.DualCharts = class {
       this._carry.yes = yes;
       this._carry.no = no;
     }
+    if (point.fair_yes != null) this._carry.fair = point.fair_yes;
     if (point.twap_oracle != null && point.twap_oracle > 0) {
       this._carry.twap = point.twap_oracle;
     }
@@ -1013,7 +1100,8 @@ PM.DualCharts = class {
   }
 
   _resetCarry() {
-    this._carry = { oracle: null, binance: null, twap: null, yes: null, no: null };
+    this._carry = { oracle: null, binance: null, twap: null, yes: null, no: null, fair: null };
+    this._painted = {};
     this._hasStart = { oracle: false, binance: false, twap: false, yes: false, no: false };
     this._twapInitial = null;
   }
@@ -1024,9 +1112,12 @@ PM.DualCharts = class {
     this.twapSeries.setData([]);
     this.yesSeries.setData([]);
     this.noSeries.setData([]);
+    this.fairSeries.setData([]);
+    this._lastFairTime = -1;
     this._setCurrentLine(null);
     this._lastChartTime = -1;
     this._windowHistory = false;
+    this._lateStart = false;
     this._resetCarry();
     this._syncEndLabels();
   }
@@ -1133,6 +1224,19 @@ PM.DualCharts = class {
     if (seed == null) return series;
     this._hasStart[key] = true;
     return [{ time: chartStart, value: seed }, ...series];
+  }
+
+  /** Sparse fair-value line: one point per stored sample, last value per slot. */
+  _buildFairSeries(points) {
+    const bySlot = new Map();
+    for (const p of points || []) {
+      if (p.fair_yes == null) continue;
+      const t = this._toChartTime(p.ts_ms);
+      if (t != null) bySlot.set(t, p.fair_yes);
+    }
+    return [...bySlot.entries()]
+      .sort((a, b) => a[0] - b[0])
+      .map(([time, value]) => ({ time, value }));
   }
 
   _buildSeries(points) {
@@ -1253,37 +1357,39 @@ PM.DualCharts = class {
     };
   }
 
+  /** Put `value` at 0:00, keeping any live points already painted after it. */
+  _setStartPoint(series, value) {
+    const chartStart = this._chartStartTime();
+    const data = series.data();
+    if (!data.length || data[data.length - 1].time <= chartStart) {
+      series.update({ time: chartStart, value });
+      return;
+    }
+    // Live points landed before the start value was known (the window-open
+    // TWAP arrives 1-2s after the open): rebuild with 0:00 first. update()
+    // would throw here, since 0:00 is older than the last point.
+    const rest = data[0].time === chartStart ? data.slice(1) : data;
+    series.setData([{ time: chartStart, value }, ...rest]);
+  }
+
   _ensureStartUpdate(series, key, value) {
     const chartStart = this._chartStartTime();
     if (!this._startTs || value == null || this._hasStart[key]) return;
-    series.update({ time: chartStart, value });
+    this._setStartPoint(series, value);
     this._hasStart[key] = true;
     if (this._lastChartTime < 0) this._lastChartTime = chartStart;
   }
 
   _seedStartFromCarry() {
-    this._ensureStartUpdate(
-      this.oracleSeries,
-      "oracle",
-      this._openingPrice ?? this._carry.oracle
-    );
-    this._ensureStartUpdate(
-      this.binanceSeries,
-      "binance",
-      this._openingBinance ?? this._carry.binance
-    );
+    // After a late start the current price is not the opening: seed 0:00 only
+    // from real opening values, never from carry.
+    const carry = this._lateStart ? {} : this._carry;
+    this._ensureStartUpdate(this.oracleSeries, "oracle", this._openingPrice ?? carry.oracle);
+    this._ensureStartUpdate(this.binanceSeries, "binance", this._openingBinance ?? carry.binance);
     this._ensureStartUpdate(this.twapSeries, "twap", this._twapInitial);
     if (this._carry.yes != null && this._carry.no != null) {
-      this._ensureStartUpdate(
-        this.yesSeries,
-        "yes",
-        this._openingProb?.yes ?? this._carry.yes
-      );
-      this._ensureStartUpdate(
-        this.noSeries,
-        "no",
-        this._openingProb?.no ?? this._carry.no
-      );
+      this._ensureStartUpdate(this.yesSeries, "yes", this._openingProb?.yes ?? carry.yes);
+      this._ensureStartUpdate(this.noSeries, "no", this._openingProb?.no ?? carry.no);
     }
   }
 
@@ -1297,6 +1403,17 @@ PM.DualCharts = class {
     openingProb = null,
     twapInitial = null
   ) {
+    const sameWindow = !!startTs && this._startTs === startTs && this._endTs === endTs;
+    if (sameWindow && (!points || !points.length) && this._lastChartTime >= 0) {
+      // The new window's REST history is usually still empty right after a
+      // roll; replacing the live-painted lines with nothing loses them.
+      if (openingPrice != null) this._openingPrice = openingPrice;
+      if (openingBinance != null) this._openingBinance = openingBinance;
+      if (openingProb != null) this._openingProb = openingProb;
+      if (twapInitial != null) this.setTwapInitial(twapInitial);
+      this._syncLivePaintLoop();
+      return;
+    }
     if (startTs && endTs) {
       this.setWindowBounds(
         startTs,
@@ -1371,6 +1488,10 @@ PM.DualCharts = class {
       this.twapSeries.setData(twap);
       this.yesSeries.setData(yes);
       this.noSeries.setData(no);
+      const fair = this._buildFairSeries(points);
+      this.fairSeries.setData(fair);
+      this._lastFairTime = fair.length ? fair[fair.length - 1].time : -1;
+      if (fair.length) this._carry.fair = fair[fair.length - 1].value;
       // Target line tracks TWAP initial.
       this._setStrike(this._twapInitial ?? strikePrice);
       if (oracle.length) {
@@ -1398,6 +1519,9 @@ PM.DualCharts = class {
       this._lastChartTime = lastTime;
     }
     this._windowHistory = !!(oracle.length || binance.length || twap.length || yes.length);
+    if (this._windowHistory) this._lateStart = false;
+    // The lines now end on the history's last values.
+    this._painted = { ...this._carry };
     this._capLastChartTimeToNow();
     this._applyFixedProbScale();
     this._syncLivePaintLoop();
@@ -1454,6 +1578,7 @@ PM.DualCharts = class {
       this._paintRaf = 0;
     }
     this._stopLivePaintLoop();
+    document.removeEventListener("visibilitychange", this._onVisibility);
     this._resizeObserver.disconnect();
     this._oracleTooltip?.remove();
     this._probTooltip?.remove();
@@ -1682,13 +1807,20 @@ PM.CandleChart = class {
 
   updateLive(bar) {
     if (!bar || bar.time == null) return;
-    this._series.update({
-      time: bar.time,
-      open: bar.open,
-      high: bar.high,
-      low: bar.low,
-      close: bar.close,
-    });
+    try {
+      this._series.update({
+        time: bar.time,
+        open: bar.open,
+        high: bar.high,
+        low: bar.low,
+        close: bar.close,
+      });
+    } catch (_) {
+      // Older than the last bar: right after a 5m <-> 15m switch the previous
+      // interval's candles are shown until loadCandles() replaces them. Skip;
+      // throwing here aborted the caller's tick handling (price + YES/NO).
+      return;
+    }
     const prev = this._meta.get(bar.time) || {};
     this._meta.set(bar.time, { ...prev, ...bar, live: true });
   }

@@ -54,23 +54,23 @@
     <div class="metric-hud" aria-label="Market metrics">
       <div class="price-metrics">
         <div class="price-block initial-block">
-          <div class="price-label">Initial TWAP</div>
-          <div id="hero-initial" class="price-value" title="TWAP initial (window open)">—</div>
+          <div class="price-label">Initial TWAP <button type="button" class="tip-btn" data-help="initial_twap"><svg class="icon"><use href="#i-info"/></svg></button></div>
+          <div id="hero-initial" class="price-value">—</div>
         </div>
         <div class="hud-divider" aria-hidden="true"></div>
         <div class="price-block current-block">
-          <div class="price-label current-label">Chainlink</div>
+          <div class="price-label current-label">Chainlink <button type="button" class="tip-btn" data-help="chainlink"><svg class="icon"><use href="#i-info"/></svg></button></div>
           <div id="hero-current" class="price-value current-value">—</div>
         </div>
         <div class="hud-divider" aria-hidden="true"></div>
         <div class="price-block twap-block">
-          <div class="price-label twap-label" id="hero-twap-label">TWAP 60s</div>
-          <div id="hero-twap" class="price-value twap-value" title="Chainlink TWAP via Polymarket RTDS">—</div>
+          <div class="price-label twap-label"><span id="hero-twap-label">TWAP 60s</span> <button type="button" class="tip-btn" data-help="twap"><svg class="icon"><use href="#i-info"/></svg></button></div>
+          <div id="hero-twap" class="price-value twap-value">—</div>
         </div>
         <div class="hud-divider" aria-hidden="true"></div>
         <div class="price-block diff-block">
-          <div class="price-label">Difference</div>
-          <div id="hero-diff" class="price-delta" title="Current TWAP − initial TWAP">—</div>
+          <div class="price-label">Difference <button type="button" class="tip-btn" data-help="difference"><svg class="icon"><use href="#i-info"/></svg></button></div>
+          <div id="hero-diff" class="price-delta">—</div>
         </div>
       </div>
       <div id="countdown" class="countdown poly-countdown">
@@ -88,6 +88,34 @@
         </div>
         <span id="countdown-outcome" class="countdown-outcome" hidden></span>
       </div>
+    </div>
+
+    <div class="edge-strip" aria-label="Fair value, order book and Binance lead">
+      <div class="edge-cell">
+        <span class="edge-label">Fair YES <button type="button" class="tip-btn" data-help="fair_yes"><svg class="icon"><use href="#i-info"/></svg></button></span><span id="edge-fair" class="edge-value">—</span>
+      </div>
+      <div class="edge-cell">
+        <span class="edge-label">YES edge <button type="button" class="tip-btn" data-help="yes_edge"><svg class="icon"><use href="#i-info"/></svg></button></span><span id="edge-yes" class="edge-value">—</span>
+      </div>
+      <div class="edge-cell">
+        <span class="edge-label">NO edge <button type="button" class="tip-btn" data-help="no_edge"><svg class="icon"><use href="#i-info"/></svg></button></span><span id="edge-no" class="edge-value">—</span>
+      </div>
+      <div class="edge-cell">
+        <span class="edge-label">σ /√s <button type="button" class="tip-btn" data-help="sigma"><svg class="icon"><use href="#i-info"/></svg></button></span><span id="edge-sigma" class="edge-value">—</span>
+      </div>
+      <div class="edge-cell">
+        <span class="edge-label">YES ask size · depth <button type="button" class="tip-btn" data-help="yes_book"><svg class="icon"><use href="#i-info"/></svg></button></span><span id="book-yes" class="edge-value">—</span>
+      </div>
+      <div class="edge-cell">
+        <span class="edge-label">NO ask size · depth <button type="button" class="tip-btn" data-help="no_book"><svg class="icon"><use href="#i-info"/></svg></button></span><span id="book-no" class="edge-value">—</span>
+      </div>
+      <div class="edge-cell">
+        <span class="edge-label">Volume <button type="button" class="tip-btn" data-help="volume"><svg class="icon"><use href="#i-info"/></svg></button></span><span id="book-volume" class="edge-value">—</span>
+      </div>
+      <div class="edge-cell">
+        <span class="edge-label">Binance lead <button type="button" class="tip-btn" data-help="lead_lag"><svg class="icon"><use href="#i-info"/></svg></button></span><span id="lead-lag" class="edge-value">—</span>
+      </div>
+      <button type="button" id="alerts-toggle" class="alerts-toggle" aria-pressed="false">Alerts: off</button>
     </div>
     </div>
 
@@ -120,6 +148,7 @@
           <div class="chart-legend" aria-hidden="true">
             <span class="legend-item legend-yes">YES ask</span>
             <span class="legend-item legend-no">NO ask</span>
+            <span class="legend-item legend-fair">Fair YES</span>
           </div>
         </div>
         <div class="chart-head-right">
@@ -167,6 +196,7 @@
     </div>
   </aside>
 </main>
+<div id="alert-stack" class="alert-stack" aria-live="polite"></div>
 
 <script>
   window.PM_CONFIG = {
@@ -182,7 +212,9 @@
 {% endblock %}
 {% block scripts %}
 <script src="/static/js/lib/format.js?v=term49"></script>
-<script src="/static/js/lib/ws.js?v=term43"></script>
-<script src="/static/js/lib/charts.js?v=term64"></script>
-<script src="/static/js/dashboard.js?v=term55"></script>
+<script src="/static/js/lib/ws.js?v=term44"></script>
+<script src="/static/js/lib/analytics.js?v=term1"></script>
+<script src="/static/js/lib/help_tips.js?v=tip1"></script>
+<script src="/static/js/lib/charts.js?v=term67"></script>
+<script src="/static/js/dashboard.js?v=term57"></script>
 {% endblock %}
