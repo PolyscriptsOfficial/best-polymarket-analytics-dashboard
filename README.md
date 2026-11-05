@@ -15,7 +15,8 @@ Full write-up: **[FEATURES.md](FEATURES.md)** · Recent changes: **[CHANGELOG.md
 **Live terminal** (`/`)
 - BTC, ETH, SOL Up/Down — 5m and 15m
 - Clock-based window rolls (charts + TWAP target reset at the 5m/15m boundary; countdown stays live)
-- Chainlink spot + 60s TWAP, initial TWAP (price to beat) synced to chart target line, Binance overlay
+- Chainlink spot (blue) + 60s TWAP (cyan), initial TWAP synced to the chart target, Binance spot (gold)
+- Price and probability charts open on the full window; live lines step every 200 ms
 - Reliable history fill when switching 5m/15m or after a roll (REST + WebSocket backfill)
 - Polymarket CLOB YES/NO asks
 - UP/DOWN candlesticks: 5m per candle on 5m markets, 15m per candle on 15m
@@ -48,7 +49,7 @@ pip install -e .
 .\scripts\run.ps1
 ```
 
-Open **http://127.0.0.1:8000**
+Open **http://127.0.0.1:8420**
 
 ```powershell
 # split processes
@@ -70,8 +71,6 @@ Linux: `pm2 start ecosystem.config.js`
 
 ## Data
 
-| Table | Source |
-|-------|--------|
 | Store | What |
 |-------|------|
 | `ticks` (SQLite, ~24h) | 1s merged samples for the live UI |
@@ -103,7 +102,7 @@ Windows archive to `data/archive/*.parquet`. SQLite 1s ticks older than 24 hours
 Remote dataset (`/v1` is public; no token):
 
 ```powershell
-python scripts/fetch_dataset.py --url http://<collector>:8000 `
+python scripts/fetch_dataset.py --url http://<collector>:8420 `
   --start 2026-10-01T00:00:00Z --end 2026-10-27T00:00:00Z --asset BTC --interval 5m
 ```
 
@@ -114,7 +113,7 @@ Contract for the backtest app: **[docs/history-dataset.md](docs/history-dataset.
 ## Config
 
 ```powershell
-$env:PM_PORT = "8000"
+$env:PM_PORT = "8420"
 $env:PM_HOST = "127.0.0.1"          # default is 0.0.0.0
 $env:PM_FEED_RECORD = "0"           # default; set 1 only for raw History tabs
 $env:PM_TICK_RETENTION_HOURS = "24"
